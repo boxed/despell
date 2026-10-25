@@ -36,9 +36,18 @@ A selector is a mutant id (`mylib.mathx.clamp.1`), a function or module
 prefix (`mylib.mathx.clamp`, `mylib.mathx`), a glob, a source file, or
 `file:line`.
 
-The loop an agent runs: `despell run`, `despell show` a few survivors, write
-tests, `despell run <those ids>` to confirm they're killed. There's a
-ready-made Claude Code skill for this in `skills/kill-survivors/`.
+The loop an agent runs (`despell guide` spells it out for them):
+
+1. Start `despell run` in the background. It prints each survivor as soon as
+   it's found, and saves results as it goes.
+2. `despell show` the survivors of a function, and write tests that kill them
+   in a new, small test file.
+3. `despell run <those ids>` to confirm they're killed. This can run while
+   the long run is still going (it works on its own copy of the project), and
+   it only builds test files that are new or changed since the mutants were
+   checked, so a small new file means a re-check in seconds.
+
+There's a ready-made Claude Code skill for this in `skills/kill-survivors/`.
 
 Silence an equivalent mutant with `# pragma: no mutate` on its line, or on the
 `def` line for the whole function.
@@ -62,10 +71,12 @@ timeout_multiplier = 10.0
 timeout_floor = 2.0
 ```
 
-Results live in `mutants/despell.json`, saved as the run goes. A plain
-`despell run` only runs mutants without a result, so an interrupted run
-continues where it stopped; a change to the tests makes it run everything
-again. Delete `mutants/` to start over.
+Results live in `mutants/despell.json`, saved as the run goes. Each result
+remembers the test files it was obtained with, so a plain `despell run` only
+runs what could have changed: mutants without a result (an interrupted run
+continues where it stopped), changed code, killed mutants whose killing test
+file changed, and survivors against new or changed test files. A change to
+shared test code re-runs everything. Delete `mutants/` to start over.
 
 despell copies the project into `mutants/` (minus version control,
 environments and caches) and runs the tests there. It puts a `.gitignore`

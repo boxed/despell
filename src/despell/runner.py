@@ -12,7 +12,10 @@ Phases:
 from __future__ import annotations
 
 import bisect
+import contextlib
+import fcntl
 import fnmatch
+import os
 import hashlib
 import json
 import queue
@@ -20,7 +23,7 @@ import re
 import shutil
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -29,6 +32,9 @@ from .project import Config, MojoEnv, find_mojo
 from .tokenizer import TokenizeError, tokenize
 
 STATE_FILE = "despell.json"
+STATE_LOCK = "despell.lock"
+MAIN_LOCK = "main.lock"  # held by the run working in mutants/ itself
+SIDE_DIR = ".side"  # runs alongside it work in mutants/.side/<pid>
 WORK_DIR = ".despell"
 STATS_MODE = "-1"
 # version control, environments and caches: big, and no test reads them
@@ -73,6 +79,8 @@ class MutantRecord:
     detail: str | None = None
     # the statement holding the mutant, for coverage (None: use the function's)
     site: int | None = None
+    # the snapshot of the tests this result was obtained with
+    tested_with: str | None = None
 
 
 @dataclass
@@ -84,6 +92,8 @@ class TestRecord:
     duration: float = 0.0
     functions: list[int] = field(default_factory=list)
     sites: list[int] = field(default_factory=list)
+    # the snapshot of the sources and tests this coverage was measured with
+    snapshot: str | None = None
 
 
 @dataclass
@@ -263,10 +273,14 @@ def add_exports(text: str, skip: set[int]) -> Exported:
 
 
 class Run:
-    def __init__(self, config: Config, *, workers: int):
+    def __init__(self, config: Config, *, workers: int, tree: Path | None = None):
         self.config = config
         self.workers = workers
-        self.mdir = config.mutants_dir
+        # where the project copy goes: mutants/, or a private one beside it
+        self.mdir = tree or config.mutants_dir
+        # test files each mutant is run against (None: all that reach it)
+        self.allowed: dict[int, set[str] | None] = {}
+        self.stats_done = False
         self.work = self.mdir / WORK_DIR
         self.mojo: MojoEnv | None = None
         self.files: list[SourceFile] = []
@@ -286,13 +300,13 @@ class Run:
             for child in self.mdir.iterdir():
                 # an editor's environment in here is expensive to recreate,
                 # and something else may be writing to it (Finder, say)
-                if child.name in (STATE_FILE, WORK_DIR) or child.name in NOT_COPIED:
+                if child.name in (STATE_FILE, STATE_LOCK, MAIN_LOCK, SIDE_DIR, WORK_DIR) or child.name in NOT_COPIED:
                     continue
                 if child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
                 else:
                     child.unlink(missing_ok=True)
-        self.mdir.mkdir(exist_ok=True)
+        self.mdir.mkdir(parents=True, exist_ok=True)
         # keep mutants/ out of git, unless the project already does: tests
         # that honor .gitignore (a file tree, say) would see an empty project
         try:
@@ -491,7 +505,15 @@ class Run:
 
         t0 = time.monotonic()
         self.n_builds = 0
-        self._precheck(enabled, disabled_functions)
+        # the pre-check can only reject mutants: the ones that compiled in an
+        # earlier build, unchanged since, don't need it
+        unknown = {
+            n for n in enabled
+            if not ((old := previous.get(self.mutants[n].id)) and old.fingerprint == self.mutants[n].fingerprint
+                    and old.status in (KILLED, SURVIVED, TIMEOUT, NO_TESTS))
+        }
+        self._precheck(unknown, disabled_functions)
+        enabled -= {n for n in enabled if self.mutants[n].status == COMPILE_ERROR}
         t_pre = time.monotonic()
         self._converge(enabled, disabled_functions, "llvm")
         t1 = time.monotonic()
@@ -876,6 +898,13 @@ class Run:
         try:
             # only the tests that run the mutant's statement can kill it
             tests = tests_by_fid.get(m.fid, []) if m.site is None else (tests_by_site or {}).get(m.site, [])
+            allowed = self.allowed.get(m.number)
+            if allowed is not None:
+                # a survivor re-checked against new or changed tests only:
+                # if none of them reach it, its earlier result stands
+                tests = [t for t in tests if t.file in allowed]
+                if not tests:
+                    return
             self._run_mutant(m, tests, runs)
         finally:
             self.timings.append((m.id, m.status, len(runs), sum(runs), time.monotonic() - t0))
@@ -948,25 +977,31 @@ class Run:
         self.timings: list[tuple[str, str, int, int, float]] = []
         t0 = time.monotonic()
         last_report = last_save = t0
-        done = 0
+        done: set[str] = set()
         pool = ThreadPoolExecutor(self.workers)
         try:
-            for _ in pool.map(lambda m: self.run_mutant(m, tests_by_fid, tests_by_site), todo):
-                done += 1
+            futures = {pool.submit(self.run_mutant, m, tests_by_fid, tests_by_site): m for m in todo}
+            for future in as_completed(futures):
+                future.result()
+                m = futures[future]
+                done.add(m.id)
+                if m.status in ACTIONABLE:
+                    # as they come, so an agent can start on them right away
+                    log(f"  {m.status:<10} {m.id}  {m.file}:{m.line}:{m.col}  {m.description}")
                 now = time.monotonic()
-                if now - last_report > 10 and done < len(todo):
-                    log(f"  {done}/{len(todo)} mutants done")
+                if now - last_report > 10 and len(done) < len(todo):
+                    log(f"  {len(done)}/{len(todo)} mutants done")
                     last_report = now
-                if checkpoint and now - last_save > 60:
-                    checkpoint({m.id for m in todo[:done]})
+                if checkpoint and now - last_save > 10:
+                    checkpoint(set(done))
                     last_save = now
         except KeyboardInterrupt:
             # don't wait for the mutants still queued; keep what's done
             pool.shutdown(wait=False, cancel_futures=True)
             if checkpoint:
-                checkpoint({m.id for m in todo[:done]})
+                checkpoint(set(done))
             self._write_timings()
-            log(f"interrupted after {done}/{len(todo)} mutants; `despell run` continues from there")
+            log(f"interrupted after {len(done)}/{len(todo)} mutants; `despell run` continues from there")
             raise
         pool.shutdown()
         self._write_timings()
@@ -981,42 +1016,54 @@ def state_path(config: Config) -> Path:
     return config.mutants_dir / STATE_FILE
 
 
-def load_state(config: Config) -> tuple[dict[str, MutantRecord], dict[str, TestRecord]]:
+@contextlib.contextmanager
+def state_lock(config: Config):
+    """Runs side by side share the state file: read, merge and write under this."""
+    config.mutants_dir.mkdir(exist_ok=True)
+    with open(config.mutants_dir / STATE_LOCK, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+@dataclass
+class State:
+    mutants: dict[str, MutantRecord] = field(default_factory=dict)
+    tests: dict[str, TestRecord] = field(default_factory=dict)
+    # snapshot id -> hash per test file, "*" for the rest of the tests
+    # directory and "sources" for the code under test
+    snapshots: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+def read_state(config: Config) -> State:
     path = state_path(config)
     if not path.exists():
-        return {}, {}
+        return State()
     data = json.loads(path.read_text())
-    mutants = {m["id"]: MutantRecord(**m) for m in data.get("mutants", [])}
-    tests = {t["id"]: TestRecord(**t) for t in data.get("tests", [])}
-    return mutants, tests
+    return State(
+        mutants={m["id"]: MutantRecord(**m) for m in data.get("mutants", [])},
+        tests={t["id"]: TestRecord(**t) for t in data.get("tests", [])},
+        snapshots=data.get("snapshots", {}),
+    )
 
 
-def load_tests_hash(config: Config) -> str | None:
-    path = state_path(config)
-    return json.loads(path.read_text()).get("tests_hash") if path.exists() else None
+def load_state(config: Config) -> tuple[dict[str, MutantRecord], dict[str, TestRecord]]:
+    state = read_state(config)
+    return state.mutants, state.tests
 
 
-def load_test_hashes(config: Config) -> dict:
-    path = state_path(config)
-    return json.loads(path.read_text()).get("test_hashes", {}) if path.exists() else {}
-
-
-def save_state(
-    config: Config,
-    mutants: list[MutantRecord],
-    tests: list[TestRecord],
-    tests_hash: str | None = None,
-    test_hashes: dict | None = None,
-):
+def write_state(config: Config, state: State):
+    used = {m.tested_with for m in state.mutants.values()} | {t.snapshot for t in state.tests.values()}
     data = {
-        "version": 1,
-        "tests_hash": tests_hash,
-        "test_hashes": test_hashes or {},
-        "mutants": [asdict(m) for m in sorted(mutants, key=lambda m: m.number)],
-        "tests": [asdict(t) for t in tests],
+        "version": 2,
+        "mutants": [asdict(m) for m in sorted(state.mutants.values(), key=lambda m: m.number)],
+        "tests": [asdict(t) for t in state.tests.values()],
+        "snapshots": {k: v for k, v in state.snapshots.items() if k in used},
     }
     path = state_path(config)
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=1))
     tmp.replace(path)
 
@@ -1033,17 +1080,6 @@ def matches(m: MutantRecord, selectors: list[str]) -> bool:
         elif m.file == s:
             return True
     return False
-
-
-def tests_fingerprint(config: Config) -> str:
-    """A hash of everything in the tests directory: results from a run with
-    other tests can't be trusted."""
-    h = hashlib.sha256()
-    tests_root = config.root / config.tests_dir
-    for path in sorted(tests_root.rglob("*")):
-        if path.is_file() and not any(part in NOT_COPIED for part in path.relative_to(tests_root).parts):
-            h.update(str(path.relative_to(tests_root)).encode() + b"\0" + path.read_bytes() + b"\0")
-    return h.hexdigest()[:16]
 
 
 def test_file_hashes(config: Config, test_files: set[str]) -> dict[str, str]:
@@ -1064,105 +1100,205 @@ def test_file_hashes(config: Config, test_files: set[str]) -> dict[str, str]:
     return hashes
 
 
-def _needed_test_files(
-    selected: list[MutantRecord], old_tests: dict[str, TestRecord], old_hashes: dict, hashes: dict
-) -> set[str] | None:
-    """The test files that can kill the selected mutants, or None for all.
-
-    Those whose tests ran the mutants' code last time, and the ones changed
-    since, which may now. Coverage is by mutant and function numbers, which
-    only hold while the sources are the same.
-    """
-    if not old_tests or old_hashes.get("sources") != hashes["sources"] or old_hashes.get("*") != hashes["*"]:
-        return None
-    needed = {f for f, h in hashes.items() if f not in ("*", "sources") and old_hashes.get(f) != h}
-    for t in old_tests.values():
-        if t.file in needed:
-            continue
-        for m in selected:
-            if (m.site in t.sites) if m.site is not None else (m.fid in t.functions):
-                needed.add(t.file)
-                break
-    return needed
+def snapshot_id(snapshot: dict[str, str]) -> str:
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()[:12]
 
 
-# a mutant with one of these from an earlier run, and the same code and tests,
-# isn't run again
+# results that only change when the code or the tests do
 FINAL = {KILLED, SURVIVED, TIMEOUT, NO_TESTS}
 
 
+def _plan(m: MutantRecord, old: MutantRecord | None, snapshots: dict, current: dict) -> tuple[bool, set[str] | None]:
+    """Whether `m` needs running, given its earlier result, and against which
+    test files (None: every one that reaches it).
+
+    A killed mutant stays killed while the test file that killed it is the
+    same. A survivor can only be killed by a test file that's new or changed
+    since it was checked, so it's run against those alone.
+    """
+    if old is None or old.fingerprint != m.fingerprint or old.status not in FINAL | {COMPILE_ERROR, SKIPPED}:
+        return True, None
+    if old.status in (COMPILE_ERROR, SKIPPED):
+        return False, None  # the build carries these over
+    snap = snapshots.get(old.tested_with or "")
+    if snap is None or snap.get("*") != current["*"]:
+        return True, None
+    changed = {f for f, h in current.items() if f not in ("*", "sources") and snap.get(f) != h}
+    if old.status in (KILLED, TIMEOUT):
+        killer = (old.killed_by or "").split("::")[0]
+        return (True, None) if killer in changed or killer not in current else (False, None)
+    return (True, changed) if changed else (False, None)
+
+
+def _files_to_build(
+    selected: list[MutantRecord], plans: dict, old_tests: dict[str, TestRecord], snapshots: dict, current: dict
+) -> set[str]:
+    """The test files that can kill the selected mutants.
+
+    For a mutant re-checked against new or changed tests, those. Otherwise
+    the files whose tests reached it last time, and any file without
+    coverage measured on the same sources and tests, which might.
+    """
+    files = {f for f in current if f not in ("*", "sources")}
+    needed: set[str] = set()
+    full = []
+    for m in selected:
+        allowed = plans[m.number][1]
+        if allowed is None:
+            full.append(m)
+        else:
+            needed |= allowed
+    if not full:
+        return needed
+    by_file: dict[str, list[TestRecord]] = {}
+    for t in old_tests.values():
+        by_file.setdefault(t.file, []).append(t)
+    for f in files - needed:
+        ts = by_file.get(f)
+        snap = snapshots.get(ts[0].snapshot or "") if ts else None
+        if (
+            snap is None
+            or snap.get("sources") != current["sources"]
+            or snap.get("*") != current["*"]
+            or snap.get(f) != current[f]
+        ):
+            needed.add(f)  # coverage unknown: it might reach them
+        elif any((m.site in t.sites) if m.site is not None else (m.fid in t.functions) for t in ts for m in full):
+            needed.add(f)
+    return needed
+
+
+def merge_result(
+    ours: MutantRecord, theirs: MutantRecord | None, seen: MutantRecord | None, ran_it: bool
+) -> MutantRecord:
+    """The record to save for a mutant: this run's, or the one in the state
+    file (`theirs`), which another run may have written since this one read
+    it (`seen`)."""
+    if theirs is None or theirs.fingerprint != ours.fingerprint:
+        return ours  # new, or the code changed
+    if not ran_it:
+        return theirs
+    written_since = seen is None or (theirs.status, theirs.tested_with) != (seen.status, seen.tested_with)
+    if written_since and theirs.status in (KILLED, TIMEOUT) and ours.status in (SURVIVED, NO_TESTS):
+        # another run killed it meanwhile, with other tests: a kill stands
+        # while the test file that did it is unchanged, which the next run
+        # checks
+        return theirs
+    return ours
+
+
+@contextlib.contextmanager
+def _claim_tree(config: Config):
+    """mutants/ itself, or a private copy beside it if another run has it."""
+    config.mutants_dir.mkdir(exist_ok=True)
+    lock = open(config.mutants_dir / MAIN_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        side = config.mutants_dir / SIDE_DIR / str(os.getpid())
+        log(f"another despell run is using mutants/; this one works in {side.relative_to(config.root)}")
+        try:
+            yield side
+        finally:
+            shutil.rmtree(side, ignore_errors=True)
+        return
+    try:
+        yield config.mutants_dir
+    finally:
+        lock.close()
+
+
 def run(config: Config, *, selectors: list[str], workers: int) -> list[MutantRecord]:
-    """Run the selected mutants, or, without selectors, the ones without a
-    result yet. Returns the selected mutants, or all of them."""
-    previous, old_tests = load_state(config)
-    tests_hash = tests_fingerprint(config)
-    tests_changed = previous and load_tests_hash(config) != tests_hash
-    r = Run(config, workers=workers)
+    """Run the selected mutants, or, without selectors, every mutant without
+    an up-to-date result. Returns the selected mutants, or all of them."""
+    with _claim_tree(config) as tree:
+        return _run(config, selectors, workers, tree)
+
+
+def _run(config: Config, selectors: list[str], workers: int, tree: Path) -> list[MutantRecord]:
     t0 = time.monotonic()
+    with state_lock(config):
+        before = read_state(config)
+    r = Run(config, workers=workers, tree=tree)
     r.prepare()
     all_tests = discover_tests(config)
     if not all_tests:
         raise RunError(f"no test files found in {config.tests_dir}")
-    r.tests = all_tests
-    all_files = {t.file for t in all_tests}
-    hashes = test_file_hashes(config, all_files)
-    hashes["sources"] = hashlib.sha256("\0".join(sf.source for sf in r.files).encode()).hexdigest()[:16]
+    current = test_file_hashes(config, {t.file for t in all_tests})
+    current["sources"] = hashlib.sha256("\0".join(sf.source for sf in r.files).encode()).hexdigest()[:16]
+    snap = snapshot_id(current)
     log(
         f"generated {len(r.mutants)} mutants in {r.n_functions} functions "
-        f"across {len(r.files)} files; {len(r.tests)} tests"
+        f"across {len(r.files)} files; {len(all_tests)} tests"
     )
 
+    # earlier results stand until replaced
+    for m in r.mutants.values():
+        old = before.mutants.get(m.id)
+        if old and old.fingerprint == m.fingerprint:
+            m.status, m.killed_by, m.detail, m.tested_with = old.status, old.killed_by, old.detail, old.tested_with
+    plans = {m.number: _plan(m, before.mutants.get(m.id), before.snapshots, current) for m in r.mutants.values()}
     if selectors:
-        selected = [m for m in r.mutants.values() if matches(m, selectors)]
-        if not selected:
+        chosen = [m for m in r.mutants.values() if matches(m, selectors)]
+        if not chosen:
             raise RunError(f"no mutants match {' '.join(selectors)}")
     else:
-        if tests_changed:
-            log("the tests changed since the last run: running every mutant again")
-            previous = {k: v for k, v in previous.items() if v.status not in FINAL}
-
-        def has_result(m: MutantRecord) -> bool:
-            old = previous.get(m.id)
-            return bool(old and old.fingerprint == m.fingerprint and old.status in FINAL | {COMPILE_ERROR, SKIPPED})
-
-        selected = [m for m in r.mutants.values() if not has_result(m)]
-        resumed = len(r.mutants) - len(selected)
-        if resumed:
-            log(f"{resumed} mutants have results from an earlier run; running the other {len(selected)}")
+        chosen = list(r.mutants.values())
+    selected = [m for m in chosen if plans[m.number][0]]
+    if len(selected) < len(chosen):
+        log(
+            f"{len(chosen) - len(selected)} mutants have results no change to the code or tests since "
+            f"affects; running the other {len(selected)}"
+        )
 
     def save(fresh: set[str]):
-        """Save, keeping earlier results for the unchanged mutants not in `fresh`."""
-        mutants = []
-        for m in r.mutants.values():
-            old = previous.get(m.id)
-            if m.id not in fresh and m.status not in (COMPILE_ERROR, SKIPPED) and old and old.fingerprint == m.fingerprint:
-                m = MutantRecord(**{**asdict(m), "status": old.status, "killed_by": old.killed_by, "detail": old.detail})
-            mutants.append(m)
-        # tests that weren't run this time keep their coverage from before
-        ran = {t.file for t in r.tests}
-        kept = [t for t in old_tests.values() if t.file not in ran] if len(ran) < len(all_files) else []
-        save_state(config, mutants, r.tests + kept, tests_hash, hashes)
-        return mutants
+        """Merge this run's results into the state file: the mutants in
+        `fresh`, its compile verdicts and its coverage. Another run may have
+        saved since, so everything else comes from the file."""
+        with state_lock(config):
+            state = read_state(config)
+            for m in r.mutants.values():
+                ran_it = m.id in fresh or m.status in (COMPILE_ERROR, SKIPPED)
+                state.mutants[m.id] = merge_result(m, state.mutants.get(m.id), before.mutants.get(m.id), ran_it)
+            for gone in set(state.mutants) - {m.id for m in r.mutants.values()}:
+                del state.mutants[gone]
+            if r.stats_done:
+                ran = {t.file for t in r.tests}
+                state.tests = {k: t for k, t in state.tests.items() if t.file not in ran and t.file in current}
+                state.tests.update({t.id: t for t in r.tests})
+            state.snapshots[snap] = current
+            write_state(config, state)
+        return list(state.mutants.values())
 
-    selected_ids = {m.id for m in selected}
     if not selected:
-        log("nothing to run; pass mutant ids to run some again, or delete mutants/ to start over")
-        return save(fresh=set())
-    # only the selected mutants go into the build, and only the test files
+        log("nothing to run: every result is up to date. Pass mutant ids to `despell run` to run them anyway")
+        save(fresh=set())
+        return chosen
+    for m in selected:
+        m.tested_with = snap
+        r.allowed[m.number] = plans[m.number][1]
+    # Only the selected mutants go into the build, and only the test files
     # that can kill them get built: that's what makes the write-a-test,
-    # re-check loop fast
+    # re-check loop fast, above all with new tests in a new, small file.
     partial = len(selected) < len(r.mutants)
     if partial:
-        needed = _needed_test_files(selected, old_tests, load_test_hashes(config), hashes)
-        if needed is not None:
-            r.tests = [t for t in all_tests if t.file in needed]
-            log(f"building the {len(needed)} of {len(all_files)} test files that can reach these mutants")
-    r.build(previous, only={m.number for m in selected} if partial else None)
+        needed = _files_to_build(selected, plans, before.tests, before.snapshots, current)
+        r.tests = [t for t in all_tests if t.file in needed]
+        n_files = len({t.file for t in all_tests})
+        if len(needed) < n_files:
+            log(f"building the {len(needed)} of {n_files} test files that can reach these mutants")
+    else:
+        r.tests = all_tests
+    r.build(before.mutants, only={m.number for m in selected} if partial else None)
     # a long build's verdicts survive whatever goes wrong after it
     save(fresh=set())
     r.collect_stats()
+    for t in r.tests:
+        t.snapshot = snap
+    r.stats_done = True
     r.run_mutants(selected, checkpoint=lambda done: save(fresh=done))
-
-    all_mutants = save(fresh=selected_ids)
+    all_mutants = save(fresh={m.id for m in selected})
     log(f"done in {time.monotonic() - t0:.1f}s")
-    return [m for m in all_mutants if m.id in selected_ids] if selectors else all_mutants
+    chosen_ids = {m.id for m in chosen}
+    return [m for m in all_mutants if m.id in chosen_ids] if selectors else all_mutants

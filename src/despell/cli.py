@@ -35,16 +35,35 @@ tests still pass with the change in place, the mutant "survived": either the
 tests miss a behavior, or the change is equivalent and doesn't matter.
 
 Workflow:
-  despell run                     mutate everything under paths_to_mutate and test it
-  despell results                 list survivors (and mutants with no covering tests)
-  despell show <id> [<id> ...]    diff, location, and the tests that reach the code
-  ... write or strengthen a test that would fail with the mutant applied ...
-  despell run <id> [<id> ...]     re-check just those mutants
+  1. Start `despell run` in the background, with its output going to a file.
+     The first run builds everything and can take many minutes on a big
+     project. It prints each survivor the moment it's found:
+         survived   mylib.math.clamp.2  src/mylib/math.mojo:12:10  `<` -> `<=`
+     and saves results as it goes: `despell results` shows them any time.
+  2. Pick up survivors as they come, a function at a time:
+     `despell show <id> [<id> ...]` gives the diff, the location and the
+     tests that already run that line.
+  3. Write tests that pass on the original code and fail with the mutant.
+     Put them in a NEW test file, one per module under test, e.g.
+     tests/test_math_mutants.mojo, importing only what it needs. A re-check
+     only builds test files that are new or changed since a mutant was
+     checked: a small file builds in seconds, while an edit to a big
+     existing test file rebuilds all of it. Test files need top-level
+     `def test_*() raises` functions and a `main` calling
+     `TestSuite.discover_tests[__functions_in_module()]().run()`.
+  4. Re-check: `despell run <id> [<id> ...]`, or a prefix like
+     `despell run mylib.math.clamp`. It's safe to run while the long run is
+     still going: it works on its own copy, and both save into the same
+     results. Survivors are only run against new and changed test files.
+  5. Repeat from 2. When done, the new test files can stay, or be merged
+     into existing ones (that costs a rebuild of those files next time).
 
-A plain `despell run` only runs mutants without a result, so an interrupted
-run continues where it stopped, and changed code is re-checked. Changing
-anything under tests_dir makes it run every mutant again. Delete mutants/ to
-start over.
+A plain `despell run` runs every mutant without an up-to-date result: an
+interrupted run continues where it stopped, changed code is re-checked,
+killed mutants stay killed while the test file that killed them is
+unchanged, and survivors are re-run against new or changed test files only.
+A change to shared test code (anything under tests_dir that isn't a test
+file) re-runs everything. Delete mutants/ to start over.
 
 Selectors for `run`, `results` and `show`: a mutant id (mylib.math.clamp.2),
 a function or module prefix (mylib.math.clamp, mylib.math), a glob
@@ -52,20 +71,23 @@ a function or module prefix (mylib.math.clamp, mylib.math), a glob
 
 Statuses:
   killed         a test failed with the mutant applied (good)
-  survived       all covering tests passed: add or improve a test
-  no_tests       no test executes this code: add a test
+  survived       all tests that run this line passed: add or improve a test
+  no_tests       no test runs this line: add a test
   timeout        tests hung with the mutant applied (counts as killed)
   compile_error  the mutant doesn't compile (counts as killed)
   skipped        the function can't hold mutation schemata
 
-Equivalent mutants (that can't be killed) can be silenced by adding
-`# pragma: no mutate` to the line, or to the `def` line for a whole function.
+Equivalent mutants (no input can tell them from the original, e.g. `x < lo`
+-> `x <= lo` in a clamp that returns `lo` either way) can't be killed: don't
+write a meaningless test for one. Silence it with `# pragma: no mutate` on
+the line, or on the `def` line for a whole function.
 
 Configuration, in despell.toml or [tool.despell] in pixi.toml/pyproject.toml:
   paths_to_mutate = ["src"]   tests_dir = "tests"   include_dirs = ["src"]
   also_copy = []  do_not_mutate = []  build_args = []  mojo = "mojo"
   timeout_multiplier = 10.0  timeout_floor = 2.0
-Results are stored in mutants/despell.json.
+Tests run in a copy of the project in mutants/ (also_copy lists extra files
+they need). Results are stored in mutants/despell.json.
 """
 
 

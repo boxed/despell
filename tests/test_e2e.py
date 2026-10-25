@@ -173,3 +173,36 @@ def test_rerun_single_mutant_after_adding_a_test(project, capsys):
     finally:
         test_file.write_text(source)
 
+
+
+def test_new_test_file_is_checked_against_survivors_only(project, capsys):
+    new_file = project / "tests" / "test_bits.mojo"
+    new_file.write_text(
+        "from std.testing import assert_equal, TestSuite\n"
+        "from mylib.tricky import bits\n"
+        "\n\n"
+        "def test_bits() raises:\n"
+        "    assert_equal(bits(5), 23)\n"
+        "    assert_equal(bits(6), 25)\n"
+        "\n\n"
+        "def main() raises:\n"
+        "    TestSuite.discover_tests[__functions_in_module()]().run(quiet=True)\n"
+    )
+    try:
+        assert main(["run", "-j", "4"]) == 0
+        out = capsys.readouterr().out
+        # killed mutants stay killed and survivors are only run against new
+        # and changed files (test_mathx changed back after the test above),
+        # so test_tricky isn't even built
+        assert "building the 2 of 3 test files" in out
+        assert "tests/test_bits.mojo::test_bits" in {t["id"] for t in json.loads((project / "mutants" / "despell.json").read_text())["tests"]}
+        data = json.loads((project / "mutants" / "despell.json").read_text())
+        statuses = {m["id"]: m["status"] for m in data["mutants"]}
+        assert statuses["mylib.tricky.bits.1"] == "killed"
+        assert statuses["mylib.mathx.add.1"] == "killed"
+        assert statuses["mylib.mathx.clamp.1"] == "survived"
+
+        assert main(["run", "-j", "4"]) == 0
+        assert "nothing to run" in capsys.readouterr().out
+    finally:
+        new_file.unlink()
