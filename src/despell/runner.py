@@ -14,6 +14,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import queue
 import re
 import shutil
 import subprocess
@@ -84,6 +85,7 @@ class SourceFile:
     functions: list
     first_fid: int
     first_mutant: int
+    package: tuple[str, ...]  # the package the module is in, for relative imports
 
 
 def log(msg: str):
@@ -189,6 +191,21 @@ def _first_error(compiler_output: str) -> str:
     return "build failed"
 
 
+_RELATIVE_IMPORT = re.compile(r"^(\s*from\s+)(\.+)([\w.]*)(\s+import\b)", re.MULTILINE)
+
+
+def absolutize_imports(text: str, package: tuple[str, ...]) -> str:
+    """Rewrite `from .x import y` to `from pkg.x import y`, given the module's package."""
+
+    def sub(m: re.Match) -> str:
+        up = len(m.group(2)) - 1
+        base = list(package[: len(package) - up] if up else package)
+        target = ".".join(base + ([m.group(3)] if m.group(3) else []))
+        return f"{m.group(1)}{target}{m.group(4)}" if target else m.group(0)
+
+    return _RELATIVE_IMPORT.sub(sub, text)
+
+
 class Run:
     def __init__(self, config: Config, *, workers: int):
         self.config = config
@@ -201,6 +218,9 @@ class Run:
         self.tests: list[TestRecord] = []
         self.n_functions = 0
         self.n_builds = 0
+        self._slots: queue.Queue[int] = queue.Queue()
+        for i in range(workers):
+            self._slots.put(i)
 
     # ---- phase 1: generation -------------------------------------------------
 
@@ -216,7 +236,6 @@ class Run:
         if self.work.exists():
             shutil.rmtree(self.work)
         (self.work / "bin").mkdir(parents=True)
-        (self.work / "stats").mkdir()
 
         ignore = shutil.ignore_patterns(".*", "mutants", "__pycache__")
         for p in [*cfg.paths_to_mutate, cfg.tests_dir, *cfg.also_copy]:
@@ -249,7 +268,9 @@ class Run:
                 continue
             if not functions:
                 continue
-            sf = SourceFile(str(rel), module_name(module_rel), source, functions, fid, number)
+            sf = SourceFile(
+                str(rel), module_name(module_rel), source, functions, fid, number, tuple(module_rel.parent.parts)
+            )
             self.files.append(sf)
             lines = source.splitlines(keepends=True)
             for f in functions:
@@ -276,8 +297,13 @@ class Run:
     # ---- phase 2: build ------------------------------------------------------
 
     def write_schemata(
-        self, enabled: set[int], disabled_functions: set[int], dispatch_only: set[int] = frozenset()
+        self,
+        enabled: set[int],
+        disabled_functions: set[int],
+        dispatch_only: set[int] = frozenset(),
+        root: Path | None = None,
     ) -> dict[Path, GeneratedFile]:
+        root = root or self.mdir
         generated = {}
         for sf in self.files:
             gen = generate(
@@ -289,8 +315,9 @@ class Run:
                 enabled=enabled,
                 disabled_functions=disabled_functions,
                 dispatch_only=dispatch_only,
+                no_inline=True,
             )
-            path = self.mdir / sf.rel
+            path = root / sf.rel
             path.write_text(gen.text)
             generated[path.resolve()] = gen
         return generated
@@ -298,26 +325,59 @@ class Run:
     def _binary_for(self, test_file: str) -> Path:
         return self.work / "bin" / test_file.replace("/", "__").removesuffix(".mojo")
 
-    def _build_one(self, test_file: str, emit: str) -> tuple[str, int, str]:
+    def _build_one(self, test_file: str, emit: str, root: Path | None = None) -> tuple[str, int, str]:
         assert self.mojo
         # the schemata trigger lots of "unreachable code" warnings
         cmd = [*self.mojo.command, "build", "--disable-warnings"]
         for inc in self.config.include_dirs:
             cmd += ["-I", inc]
-        output = self._binary_for(test_file)
+        output = self._binary_for(test_file) if root is None else root / "despell-check"
         if emit != "exe":
-            cmd += ["--emit", emit]
+            # report every elaboration error, not just the first 20
+            cmd += ["--emit", emit, "--elaboration-error-limit=0"]
             output = output.with_suffix(".ll")
         cmd += [*self.config.build_args, test_file, "-o", str(output)]
-        proc = subprocess.run(cmd, cwd=self.mdir, env=self.mojo.env, capture_output=True, text=True)
+        proc = subprocess.run(cmd, cwd=root or self.mdir, env=self.mojo.env, capture_output=True, text=True)
         return test_file, proc.returncode, proc.stdout + proc.stderr
 
+    def _slot_build(
+        self,
+        enabled: set[int],
+        disabled_functions: set[int],
+        test_files: list[str],
+        emit: str,
+        dispatch_only: set[int] = frozenset(),
+    ) -> str | None:
+        """Build in a private copy of the project, so several can run at once.
+
+        Returns the compiler output if the build fails.
+        """
+        slot = self._slots.get()
+        try:
+            root = self.work / "slots" / str(slot)
+            if not root.exists():
+                shutil.copytree(self.mdir, root, ignore=shutil.ignore_patterns(WORK_DIR, STATE_FILE))
+            self.write_schemata(enabled, disabled_functions, dispatch_only, root=root)
+            self.n_builds += 1
+            for test_file in test_files:
+                _, code, out = self._build_one(test_file, emit, root)
+                if code != 0:
+                    return out
+            return None
+        finally:
+            self._slots.put(slot)
+
     def _build_all(
-        self, enabled: set[int], disabled_functions: set[int], emit: str, dispatch_only: set[int] = frozenset()
+        self,
+        enabled: set[int],
+        disabled_functions: set[int],
+        emit: str,
+        dispatch_only: set[int] = frozenset(),
+        test_files: list[str] | None = None,
     ):
         self.n_builds += 1
         generated = self.write_schemata(enabled, disabled_functions, dispatch_only)
-        test_files = sorted({t.file for t in self.tests})
+        test_files = test_files or sorted({t.file for t in self.tests})
         with ThreadPoolExecutor(self.workers) as pool:
             results = list(pool.map(lambda f: self._build_one(f, emit), test_files))
         return generated, [(f, out) for f, code, out in results if code != 0]
@@ -344,6 +404,8 @@ class Run:
 
         t0 = time.monotonic()
         self.n_builds = 0
+        self._precheck(enabled, disabled_functions)
+        t_pre = time.monotonic()
         self._converge(enabled, disabled_functions, "llvm")
         t1 = time.monotonic()
         _, failures = self._build_all(enabled, disabled_functions, "exe")
@@ -353,10 +415,88 @@ class Run:
         rejected = sum(1 for m in self.mutants.values() if m.status in (COMPILE_ERROR, SKIPPED))
         log(
             f"built {len({t.file for t in self.tests})} test binaries in {time.monotonic() - t0:.1f}s "
-            f"({self.n_builds} builds; checking mutants took {t1 - t0:.1f}s, {rejected} rejected)"
+            f"({self.n_builds} builds; checking mutants took {t1 - t0:.1f}s, "
+            f"of which {t_pre - t0:.1f}s pre-checking modules; {rejected} rejected)"
         )
 
-    def _converge(self, enabled: set[int], disabled_functions: set[int], emit: str):
+    def _precheck(self, enabled: set[int], disabled_functions: set[int]):
+        """Find type errors fast by checking each mutated module on its own.
+
+        Mojo only type-checks function bodies that are referenced, except in
+        the file being compiled, where it checks everything. So compiling each
+        module as its own entry point checks all of its mutants while touching
+        only what it imports, in parallel and much faster than the test builds.
+        That needs relative imports made absolute. Checking a module this way
+        reports some errors normal builds never see (code nothing references,
+        a type existing twice), so errors that the unmutated module also gets
+        are ignored. This only catches type errors: errors that need generic
+        code instantiated are left to the test builds.
+        """
+        files = [sf for sf in self.files if any(gm in enabled for gm in self._numbers(sf))]
+        if not files:
+            return
+        t0 = time.monotonic()
+        check_dir = self.work / "check"
+        check_dir.mkdir(exist_ok=True)
+        self.write_schemata(enabled, disabled_functions)
+
+        def check(sf: SourceFile, text: str, suffix: str) -> list[tuple[int, str]]:
+            assert self.mojo
+            path = check_dir / f"{sf.module}{suffix}.mojo"
+            path.write_text(absolutize_imports(text, sf.package))
+            cmd = [*self.mojo.command, "build", "--disable-warnings", "--emit", "llvm"]
+            for inc in self.config.include_dirs:
+                cmd += ["-I", inc]
+            cmd += [*self.config.build_args, str(path), "-o", str(path.with_suffix(".ll"))]
+            proc = subprocess.run(cmd, cwd=self.mdir, env=self.mojo.env, capture_output=True, text=True)
+            errors = []
+            for m in self._DIAG_RE.finditer(proc.stdout + proc.stderr):
+                if m.group(4) == "error" and (self.mdir / m.group(1)).resolve() == path.resolve():
+                    errors.append((int(m.group(2)) - 1, m.group(5)))
+            return errors
+
+        with ThreadPoolExecutor(self.workers) as pool:
+            baseline = dict(zip(
+                [sf.rel for sf in files],
+                pool.map(lambda sf: {line for line, _ in check(sf, sf.source, ".orig")}, files),
+            ))
+        rejected = 0
+        todo = files
+        for round_no in range(1, 100):
+            if not todo:
+                break
+            generated = self.write_schemata(enabled, disabled_functions)
+            texts = [(sf, generated[(self.mdir / sf.rel).resolve()]) for sf in todo]
+            with ThreadPoolExecutor(self.workers) as pool:
+                results = list(pool.map(lambda item: check(item[0], item[1].text, ""), texts))
+            todo = []
+            for (sf, gen), errors in zip(texts, results):
+                found = 0
+                for line, msg in errors:
+                    region = next(
+                        (r for r in gen.regions if r.mutant is not None and r.start <= line <= r.end), None
+                    )
+                    if region is None or region.mutant not in enabled:
+                        continue
+                    # the statement fails without the mutant too: not the mutant's fault
+                    if any(region.orig[0] <= b <= region.orig[1] for b in baseline[sf.rel]):
+                        continue
+                    self._reject(region.mutant, msg, enabled)
+                    found += 1
+                if found:
+                    rejected += found
+                    # errors hidden behind the ones just fixed may surface now
+                    todo.append(sf)
+        log(
+            f"pre-checked {len(files)} modules in {time.monotonic() - t0:.1f}s "
+            f"({round_no - 1} rounds): {rejected} mutants don't compile"
+        )
+
+    def _numbers(self, sf: SourceFile) -> range:
+        count = sum(len(f.mutations) for f in sf.functions)
+        return range(sf.first_mutant, sf.first_mutant + count)
+
+    def _converge(self, enabled: set[int], disabled_functions: set[int], emit: str, recheck: bool = True):
         """Remove mutants from `enabled` until the build passes.
 
         An error located in a mutant's own lines condemns that mutant. Vaguer
@@ -365,12 +505,20 @@ class Run:
         they're set aside, and once the rest builds, added back in groups to
         find the ones that really don't compile.
         """
-        suspects: list[tuple[set[int], int | None]] = []  # (mutants, function if it's a whole one)
+        suspects: list[tuple[set[int], int | None, list[str]]] = []  # (mutants, whole function?, test files)
+        # Taking mutants out never breaks a build that passed, so after the
+        # first attempt only the test files that failed are built again.
+        test_files = None
         for attempt in range(1, 1000):
             t0 = time.monotonic()
-            generated, failures = self._build_all(enabled, disabled_functions, emit)
+            generated, failures = self._build_all(enabled, disabled_functions, emit, test_files=test_files)
             if not failures:
                 break
+            test_files = [f for f, _ in failures]
+            logs = self.work / "logs"
+            logs.mkdir(exist_ok=True)
+            for f, out in failures:
+                (logs / f"attempt{attempt}-{emit}-{Path(f).stem}.txt").write_text(out)
             mutant_hits, site_hits, function_hits = self._attribute_errors(failures, generated)
             dropped = {n for n in mutant_hits if n in enabled}
             for n in dropped:
@@ -379,71 +527,88 @@ class Run:
             if not dropped:
                 if site_hits:
                     groups = [(set(site) & enabled, None) for site in site_hits]
+                    why = "errors in statements holding several mutants: " + "; ".join(
+                        sorted({msg[:80] for msg in site_hits.values()})[:3]
+                    )
                 elif function_hits:
                     groups = [({n for n in enabled if self.mutants[n].fid == fid}, fid) for fid in function_hits]
+                    why = f"errors pointing at {len(function_hits)} whole functions"
                 else:
                     groups = [(set(enabled), None)]
+                    why = "errors without a location: " + _first_error(failures[0][1])[:80]
+                failing_files = [f for f, _ in failures]
                 for group, fid in groups:
                     enabled -= group
                     set_aside += len(group)
                     if group:
-                        suspects.append((group, fid))
+                        suspects.append((group, fid, failing_files))
                 if not set_aside:
                     f, out = failures[0]
                     raise RunError(f"building {f} fails without any mutants:\n{_without_warnings(out)}")
             log(
                 f"build attempt {attempt} ({time.monotonic() - t0:.1f}s): {len(dropped)} mutants don't compile"
-                + (f", set aside {set_aside} suspects" if set_aside else "")
+                + (f", set aside {set_aside} suspects ({why})" if set_aside else "")
             )
         else:
             raise RunError("gave up after too many build attempts")
 
-        if suspects:
-            t0 = time.monotonic()
-            n_suspects = sum(len(g) for g, _ in suspects)
-            before = self.n_builds
-            for group, fid in suspects:
-                self._vindicate(enabled, disabled_functions, sorted(group), fid, emit)
-            bad = n_suspects - sum(1 for g, _ in suspects for n in g if n in enabled)
-            log(
-                f"checked {n_suspects} suspects in {self.n_builds - before} builds ({time.monotonic() - t0:.1f}s): "
-                f"{bad} don't compile"
-            )
+        if suspects and recheck:
+            self._check_suspects(suspects, enabled, disabled_functions, emit)
+            # each was checked alone with one test file; check them all together
+            self._converge(enabled, disabled_functions, emit, recheck=False)
+        elif suspects:
+            # set aside again after passing on their own: they only fail together
+            for group, _, _ in suspects:
+                for n in group:
+                    self._reject(n, "doesn't compile together with other mutants", enabled)
 
-    def _vindicate(self, enabled: set[int], disabled_functions: set[int], group: list[int], fid, emit: str):
-        """Add back the mutants of `group` that build on top of `enabled`."""
-        if not group:
-            return
-        if fid is not None:
-            # can the function hold the dispatch at all? (not if it's
-            # evaluated at compile time, say)
-            _, fails = self._build_all(enabled, disabled_functions, emit, dispatch_only={fid})
-            if fails:
+    def _check_suspects(self, suspects, enabled: set[int], disabled_functions: set[int], emit: str):
+        """Check set-aside mutants one at a time, in parallel.
+
+        Each check builds a single mutant and nothing else, with only the test
+        file whose build failed. That's a small program, and since nothing else
+        is in it, a failure can only be that mutant's fault.
+        """
+        t0 = time.monotonic()
+        before = self.n_builds
+        n_suspects = sum(len(group) for group, _, _ in suspects)
+
+        # first: can each implicated function hold the dispatch at all? (not if
+        # it's evaluated at compile time, say)
+        functions = [(fid, files) for _, fid, files in suspects if fid is not None]
+        with ThreadPoolExecutor(self.workers) as pool:
+            results = list(pool.map(
+                lambda item: self._slot_build(set(), disabled_functions, item[1], emit, dispatch_only={item[0]}),
+                functions,
+            ))
+        for (fid, _), out in zip(functions, results):
+            if out is not None:
                 disabled_functions.add(fid)
                 for m in self.mutants.values():
                     if m.fid == fid:
                         enabled.discard(m.number)
                         m.status = SKIPPED
-                        m.detail = f"function can't be mutated with schemata: {_first_error(fails[0][1])}"
-                return
-        generated, fails = self._build_all(enabled | set(group), disabled_functions, emit)
-        if not fails:
-            enabled.update(group)
-            return
-        if len(group) == 1:
-            self._reject(group[0], _first_error(fails[0][1]), enabled)
-            return
-        mutant_hits, _, _ = self._attribute_errors(fails, generated)
-        condemned = [n for n in group if n in mutant_hits]
-        for n in condemned:
-            self._reject(n, mutant_hits[n], enabled)
-        rest = [n for n in group if n not in mutant_hits]
-        if condemned:
-            self._vindicate(enabled, disabled_functions, rest, None, emit)
-        else:
-            half = len(rest) // 2
-            self._vindicate(enabled, disabled_functions, rest[:half], None, emit)
-            self._vindicate(enabled, disabled_functions, rest[half:], None, emit)
+                        m.detail = f"function can't be mutated with schemata: {_first_error(out)}"
+
+        singles = [
+            (n, files)
+            for group, _, files in suspects
+            for n in sorted(group)
+            if self.mutants[n].fid not in disabled_functions
+        ]
+        with ThreadPoolExecutor(self.workers) as pool:
+            results = list(pool.map(lambda item: self._slot_build({item[0]}, disabled_functions, item[1], emit), singles))
+        bad = 0
+        for (n, _), out in zip(singles, results):
+            if out is None:
+                enabled.add(n)
+            else:
+                self._reject(n, _first_error(out), enabled)
+                bad += 1
+        log(
+            f"checked {n_suspects} suspects one by one in {self.n_builds - before} builds "
+            f"({time.monotonic() - t0:.1f}s): {bad} don't compile"
+        )
 
     def _reject(self, n: int, detail: str, enabled: set[int]):
         enabled.discard(n)
@@ -453,34 +618,53 @@ class Run:
     _DIAG_RE = re.compile(r"^(?:Imported from .*\n)?(.+?\.mojo):(\d+):(\d+): (error|note): (.*)$", re.MULTILINE)
 
     def _attribute_errors(self, failures, generated):
-        """Map compiler errors (and their notes) to mutants, statements and functions.
+        """Map compiler errors to mutants, statements and functions.
 
-        Notes count: an elaboration error is often reported on the `def` line
-        with the culprit only in a note.
+        An error is followed by notes. For "function instantiation failed" the
+        notes are the chain of instantiations from `main` down to where it
+        failed, so the deepest one in our code is the culprit: a mutant's line
+        when the failure is in code it calls (a SIMD width of 33, say), or the
+        `def` of the function holding the bad mutant. The "call expansion
+        failed" notes on the way point at callers, which aren't to blame.
         """
         mutant_hits: dict[int, str] = {}
         site_hits: dict[tuple[int, ...], str] = {}
         function_hits: set[int] = set()
+
+        def region_at(path: Path, line: int):
+            if path not in generated:
+                return None
+            regions = [r for r in generated[path].regions if r.start <= line <= r.end]
+            return min(regions, key=lambda r: (r.mutant is None, r.end - r.start)) if regions else None
+
         for _, out in failures:
-            error_msg = ""
+            chains: list[list[tuple[str, Path, int, str]]] = []
             for m in self._DIAG_RE.finditer(out):
                 kind, msg = m.group(4), m.group(5)
                 if kind == "error":
-                    error_msg = msg
-                path = (self.mdir / m.group(1)).resolve()
-                if path not in generated:
-                    continue
-                line = int(m.group(2)) - 1
-                regions = [r for r in generated[path].regions if r.start <= line <= r.end]
-                if not regions:
-                    continue
-                region = min(regions, key=lambda r: (r.mutant is None, r.end - r.start))
-                if region.mutant is not None:
-                    mutant_hits.setdefault(region.mutant, error_msg)
-                elif region.site:
-                    site_hits.setdefault(region.site, error_msg)
+                    chains.append([])
+                if chains:
+                    chains[-1].append((kind, (self.mdir / m.group(1)).resolve(), int(m.group(2)) - 1, msg))
+            for chain in chains:
+                error_msg = chain[0][3]
+                if error_msg.startswith("function instantiation failed"):
+                    candidates = list(reversed(chain))  # deepest first
                 else:
-                    function_hits.add(region.fid)
+                    # the error's own location; failing that, a note in our code
+                    candidates = [chain[0]] + [
+                        d for d in chain[1:] if not d[3].startswith(("call expansion failed", "function instantiation"))
+                    ]
+                for _, path, line, msg in candidates:
+                    region = region_at(path, line)
+                    if region is None:
+                        continue
+                    if region.mutant is not None:
+                        mutant_hits.setdefault(region.mutant, error_msg)
+                    elif region.site:
+                        site_hits.setdefault(region.site, error_msg)
+                    else:
+                        function_hits.add(region.fid)
+                    break
         return mutant_hits, site_hits, function_hits
 
     # ---- phase 3: stats ------------------------------------------------------
@@ -499,24 +683,18 @@ class Run:
         return proc.returncode, time.monotonic() - t0, proc.stdout + proc.stderr
 
     def collect_stats(self):
-        def one(item):
-            i, t = item
-            stats_file = self.work / "stats" / f"{i}.txt"
+        def one(t: TestRecord):
             code, duration, out = self._run_test_binary(
-                self._binary_for(t.file),
-                [t.name] if t.name else None,
-                {"DESPELL_MUTANT": STATS_MODE, "DESPELL_STATS_FILE": str(stats_file)},
-                timeout=None,
+                self._binary_for(t.file), [t.name] if t.name else None, {"DESPELL_MUTANT": STATS_MODE}, timeout=None
             )
             t.binary = str(self._binary_for(t.file).relative_to(self.mdir))
             t.duration = duration
-            if stats_file.exists():
-                t.functions = sorted({int(x) for x in stats_file.read_text().split()})
+            t.functions = sorted({int(x) for x in re.findall(r"^despell-hit (\d+)$", out, re.MULTILINE)})
             return t, code, out
 
         t0 = time.monotonic()
         with ThreadPoolExecutor(self.workers) as pool:
-            results = list(pool.map(one, enumerate(self.tests)))
+            results = list(pool.map(one, self.tests))
         failing = [(t, out) for t, code, out in results if code != 0]
         if failing:
             msg = "\n\n".join(f"--- {t.id}\n{out.strip()}" for t, out in failing[:5])
@@ -534,10 +712,16 @@ class Run:
             m.killed_by = None
             m.detail = None
             return
+        tests = sorted(tests, key=lambda t: t.duration)
+        # One failing test is enough, but a TestSuite runs all the tests it's
+        # given. Most mutants that get killed fail the first test they meet, so
+        # the fastest test runs on its own before the rest are run together.
+        batches: list[tuple[str, list[TestRecord]]] = [(tests[0].file, tests[:1])]
         by_binary: dict[str, list[TestRecord]] = {}
-        for t in sorted(tests, key=lambda t: t.duration):
+        for t in tests[1:]:
             by_binary.setdefault(t.file, []).append(t)
-        for file, ts in sorted(by_binary.items(), key=lambda kv: sum(t.duration for t in kv[1])):
+        batches += sorted(by_binary.items(), key=lambda kv: sum(t.duration for t in kv[1]))
+        for file, ts in batches:
             names = [t.name for t in ts] if ts[0].name else None
             budget = sum(t.duration for t in ts)
             timeout = max(self.config.timeout_floor, budget * self.config.timeout_multiplier)

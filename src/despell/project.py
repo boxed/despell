@@ -105,6 +105,19 @@ def _find_pixi_manifest(start: Path) -> Path | None:
     return None
 
 
+def _env_for(mojo: Path, env: dict[str, str]) -> dict[str, str]:
+    """The environment a `mojo` inside a conda/pixi env needs to find `std`."""
+    prefix = mojo.parent.parent
+    if mojo.parent.name == "bin" and (prefix / "share" / "max").is_dir():
+        env = {
+            **env,
+            "CONDA_PREFIX": str(prefix),
+            "MODULAR_HOME": str(prefix / "share" / "max"),
+            "PATH": f"{mojo.parent}{os.pathsep}{env.get('PATH', '')}",
+        }
+    return env
+
+
 def find_mojo(config: Config) -> MojoEnv:
     """Find a `mojo` that can compile, plus the environment it needs.
 
@@ -116,7 +129,7 @@ def find_mojo(config: Config) -> MojoEnv:
     if override := os.environ.get("DESPELL_MOJO"):
         return MojoEnv(shlex.split(override), env)
     if config.mojo:
-        return MojoEnv(config.mojo, env)
+        return MojoEnv(config.mojo, _env_for(Path(config.mojo[0]), env))
     if shutil.which("mojo"):
         return MojoEnv(["mojo"], env)
 

@@ -153,3 +153,4 @@ def test_rerun_single_mutant_after_adding_a_test(project, capsys):
         assert statuses["mylib.mathx.clamp.1"] == "survived"
     finally:
         test_file.write_text(source)
+

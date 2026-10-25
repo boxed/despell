@@ -120,7 +120,9 @@ class Mutation:
 DUP = "dup"  # the statement is duplicated per mutant behind an if/elif chain
 WRAP = "wrap"  # the expression becomes a chain of ternaries, one per mutant
 # `var x: T = e` becomes `var x: T` plus a duplicated `x = e`: a ternary would
-# lose the declared type as context (a list literal for an `Array`, say)
+# lose the declared type as context (a list literal for an `Array`, say).
+# Untyped declarations stay ternaries: initializing in branches would confine
+# the origin of a reference (a `Span`, say) to the branch.
 DECL = "decl"
 
 
@@ -242,7 +244,12 @@ def mutations_for_logical_line(ll: LogicalLine) -> list[Mutation]:
             continue
 
         if tok.kind == NUMBER:
-            new = _mutate_number(tok.text)
+            if prev is not None and prev.text == "[" and nxt is not None and nxt.text == "]" and tok.text.isdigit():
+                # `x[1]` -> `x[0]` rather than `x[2]`: on a tuple, going past
+                # the last element is an error only lowering catches, slowly
+                new = str(int(tok.text) - 1) if int(tok.text) > 0 else "1"
+            else:
+                new = _mutate_number(tok.text)
             if new is not None:
                 add(tok, new)
         elif tok.kind == STRING:
@@ -363,6 +370,8 @@ def _make_site(
     indent = src.lines[ll.first_line][: ll.indent]
     if first in _UNMUTATED_STARTS:
         return None
+    if _depth0_index(toks, ";") is not None:
+        return None  # several statements on one line
     if i > 0 and body[i - 1].first.text == "@":
         return None  # e.g. `@parameter if`: compile-time
     ends_block = toks[-1].text == ":"
@@ -370,8 +379,10 @@ def _make_site(
     if first in _COMPOUND:
         if not ends_block:
             return None  # body on the same line
-        end = body[_statement_end(body, i)].last_line
-        return Site(DUP, ll.first_line, end, indent, nested, mutations)
+        end_index = _statement_end(body, i)
+        if any(b.first.text in ("def", "fn", "struct") for b in body[i + 1 : end_index + 1]):
+            return None  # a copy would declare them again
+        return Site(DUP, ll.first_line, body[end_index].last_line, indent, nested, mutations)
 
     if first == "elif":
         if not ends_block:
@@ -391,10 +402,12 @@ def _make_site(
     inside = [m for m in mutations if span[:2] <= (m.line, m.col) and (m.line, m.end_col) <= span[2:]]
     if not inside:
         return None
-    if first == "var" and len(toks) > 3 and toks[1].kind == NAME and toks[2].text == ":":
+    if first == "var" and toks[1].kind == NAME and toks[eq].line == toks[0].line:
         eq_tok = toks[eq]
-        if eq_tok.line == toks[0].line:
+        type_text = None
+        if toks[2].text == ":":
             type_text = src.lines[ll.first_line][toks[2].end_col : eq_tok.col].strip()
+        if type_text is not None:
             decl = (toks[1].text, type_text, toks[0].col, eq_tok.col)
             return Site(DECL, ll.first_line, ll.last_line, indent, nested, inside, decl=decl)
     return Site(WRAP, ll.first_line, ll.last_line, indent, nested, inside, expr=span)
@@ -494,8 +507,9 @@ def _despell_active(fid: Int) -> Int:
             var hits = _despell_hits.get_or_create_ptr()
             if not hits[][fid]:
                 hits[][fid] = True
-                with open(_despell_getenv("DESPELL_STATS_FILE"), "a") as f:
-                    f.write(String(fid), "\\n")
+                # print rather than file I/O: the program already uses print,
+                # while extra FFI could clash with the user's own declarations
+                print("despell-hit", fid)
         return m
     except:
         return 0
@@ -512,6 +526,7 @@ class Region:
     fid: int
     mutant: int | None = None  # the lines of one mutant
     site: tuple[int, ...] = ()  # the lines of a statement holding these mutants
+    orig: tuple[int, int] | None = None  # the source lines of that statement
     # with neither: the function's own dispatch lines
 
 
@@ -586,25 +601,29 @@ class _Emitter:
 
     def emit_dup(self, site: Site, active, depth: int, other_sites, ctx):
         fid, mvar = ctx(site)
+        orig = (site.first_line, site.last_line)
         ind = INDENT * depth + site.indent
         start = len(self.out)
         for k, gm in enumerate(active):
             self.out.append(f"{ind}{'if' if k == 0 else 'elif'} {mvar} == {gm.number}:\n")
             first = len(self.out)
             self.copy(_apply(self.lines, gm.mutation), site.first_line, site.last_line, depth + 1)
-            self.regions.append(Region(first, len(self.out) - 1, fid, mutant=gm.number))
+            self.regions.append(Region(first, len(self.out) - 1, fid, mutant=gm.number, orig=orig))
         self.out.append(f"{ind}else:\n")
         # only one mutant is active at a time, so statements inside this one
         # need their own dispatch only in the original copy
         self.emit_range(site.first_line, site.last_line, depth + 1, other_sites, ctx)
-        self.regions.append(Region(start, len(self.out) - 1, fid, site=tuple(gm.number for gm in active)))
+        self.regions.append(Region(start, len(self.out) - 1, fid, site=tuple(gm.number for gm in active), orig=orig))
 
     def emit_decl(self, site: Site, active, depth: int, ctx):
         fid, mvar = ctx(site)
+        orig = (site.first_line, site.last_line)
         name, type_text, var_col, eq_col = site.decl
         ind = INDENT * depth + site.indent
         start = len(self.out)
-        self.out.append(f"{ind}var {name}: {type_text}\n")
+        # the type can span lines (`type_of` of a multi-line expression), and
+        # regions count lines, so it must go in line by line
+        self.out.extend(f"{ind}var {name}: {type_text}\n".splitlines(keepends=True))
 
         def assignment(lines: list[str]) -> list[str]:
             # the mutation is after the `=`, so these columns still hold
@@ -617,13 +636,14 @@ class _Emitter:
             self.out.append(f"{ind}{'if' if k == 0 else 'elif'} {mvar} == {gm.number}:\n")
             first = len(self.out)
             self.copy(assignment(_apply(self.lines, gm.mutation)), site.first_line, site.last_line, depth + 1)
-            self.regions.append(Region(first, len(self.out) - 1, fid, mutant=gm.number))
+            self.regions.append(Region(first, len(self.out) - 1, fid, mutant=gm.number, orig=orig))
         self.out.append(f"{ind}else:\n")
         self.copy(assignment(self.lines), site.first_line, site.last_line, depth + 1)
-        self.regions.append(Region(start, len(self.out) - 1, fid, site=tuple(gm.number for gm in active)))
+        self.regions.append(Region(start, len(self.out) - 1, fid, site=tuple(gm.number for gm in active), orig=orig))
 
     def emit_wrap(self, site: Site, active, depth: int, ctx):
         fid, mvar = ctx(site)
+        orig = (site.first_line, site.last_line)
         sl, sc, el, ec = site.expr
         start = len(self.out)
         self.copy(self.lines, site.first_line, sl - 1, depth)
@@ -637,17 +657,27 @@ class _Emitter:
             expr = _span_text(mutated, sl, sc, el, m_ec)
             first = len(self.out)
             self.out.extend(f"{cont}({expr}) if {mvar} == {gm.number} else\n".splitlines(keepends=True))
-            self.regions.append(Region(first, len(self.out) - 1, fid, mutant=gm.number))
+            self.regions.append(Region(first, len(self.out) - 1, fid, mutant=gm.number, orig=orig))
         tail = self.lines[el][ec:]
         self.out.extend(f"{cont}({_span_text(self.lines, sl, sc, el, ec)})){tail}".splitlines(keepends=True))
         self.copy(self.lines, el + 1, site.last_line, depth)
-        self.regions.append(Region(start, len(self.out) - 1, fid, site=tuple(gm.number for gm in active)))
+        self.regions.append(Region(start, len(self.out) - 1, fid, site=tuple(gm.number for gm in active), orig=orig))
 
 
 def _span_text(lines: list[str], sl: int, sc: int, el: int, ec: int) -> str:
     if sl == el:
         return lines[sl][sc:ec]
     return lines[sl][sc:] + "".join(lines[sl + 1 : el]) + lines[el][:ec]
+
+
+def _inline_decorator(lines: list[str], def_line: int) -> int | None:
+    """The line of an inlining decorator on the function at `def_line`, if any."""
+    i = def_line - 1
+    while i >= 0 and lines[i].strip().startswith("@"):
+        if "inline" in lines[i]:
+            return i
+        i -= 1
+    return None
 
 
 def generate(
@@ -660,6 +690,7 @@ def generate(
     enabled: set[int] | None = None,
     disabled_functions: set[int] = frozenset(),
     dispatch_only: set[int] = frozenset(),
+    no_inline: bool = False,
 ) -> GeneratedFile:
     """Emit the schemata version of a file.
 
@@ -699,8 +730,21 @@ def generate(
                 active_sites.append((site, active))
         gen_functions.append(GeneratedFunction(fid=fid, qualname=f.qualname, def_line=f.def_line, mutants=gen_mutants))
 
-        def_line_out = len(out) + (f.def_line - pos)
-        out.extend(lines[pos : f.body_start])
+        out.extend(lines[pos : f.def_line])
+        if no_inline and active_sites and fid not in disabled_functions:
+            # Inlining functions that hold all their mutants into each other
+            # multiplies code size along call chains, which can make LLVM take
+            # many times longer than for the functions separately. A plain
+            # `@always_inline` only affects speed, so it's replaced; any other
+            # inline decorator is left alone.
+            decorator = _inline_decorator(lines, f.def_line)
+            if decorator is None:
+                def_indent = lines[f.def_line][: len(lines[f.def_line]) - len(lines[f.def_line].lstrip())]
+                out.append(f"{def_indent}@inline(.never)\n")
+            elif lines[decorator].strip() == "@always_inline":
+                out[len(out) - (f.def_line - decorator)] = lines[decorator].replace("@always_inline", "@inline(.never)")
+        def_line_out = len(out)
+        out.extend(lines[f.def_line : f.body_start])
         pos = f.body_end + 1
         if fid in disabled_functions or not active_sites:
             if fid in dispatch_only and fid not in disabled_functions:
