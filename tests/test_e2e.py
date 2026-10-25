@@ -21,9 +21,9 @@ EXPECTED = {
     "mylib.mathx.is_even.2": "killed",
     "mylib.mathx.is_even.3": "killed",
     "mylib.mathx.is_even.4": "killed",
-    "mylib.mathx.table_size.1": "skipped",
-    "mylib.mathx.table_size.2": "skipped",
-    "mylib.mathx.table_size.3": "skipped",
+    "mylib.mathx.table_size.1": "no_tests",
+    "mylib.mathx.table_size.2": "compile_error",
+    "mylib.mathx.table_size.3": "no_tests",
     "mylib.mathx.sum_to.1": "killed",
     "mylib.mathx.sum_to.2": "killed",
     "mylib.mathx.sum_to.3": "killed",
@@ -63,14 +63,14 @@ EXPECTED = {
     "mylib.tricky.count_words.1": "killed",
     "mylib.tricky.count_words.2": "compile_error",
     "mylib.tricky.count_words.3": "survived",
-    "mylib.tricky.count_words.4": "survived",
+    "mylib.tricky.count_words.4": "no_tests",
     "mylib.tricky.count_words.5": "killed",
     "mylib.tricky.count_words.6": "killed",
     "mylib.tricky.count_words.7": "killed",
     "mylib.tricky.count_words.8": "killed",
     "mylib.tricky.first_big.1": "survived",
-    "mylib.tricky.first_big.2": "survived",
-    "mylib.tricky.first_big.3": "survived",
+    "mylib.tricky.first_big.2": "no_tests",
+    "mylib.tricky.first_big.3": "no_tests",
     "mylib.tricky.bits.1": "survived",
     "mylib.tricky.bits.2": "survived",
     "mylib.tricky.bits.3": "survived",
@@ -129,8 +129,25 @@ def test_results_lists_actionable(project, capsys):
 def test_show(project, capsys):
     assert main(["show", "mylib.mathx.clamp.1"]) == 0
     out = capsys.readouterr().out
-    assert "tests reaching clamp: tests/test_mathx.mojo::test_clamp" in out
+    assert "tests reaching line 10: tests/test_mathx.mojo::test_clamp" in out
     assert "-    if x < lo:\n+    if x <= lo:" in out
+
+
+def test_run_continues_where_it_stopped(project, capsys):
+    state = project / "mutants" / "despell.json"
+    data = json.loads(state.read_text())
+    # as if the run was interrupted before these two
+    for m in data["mutants"]:
+        if m["id"] in ("mylib.mathx.add.1", "mylib.mathx.clamp.1"):
+            m["status"] = "not_checked"
+    state.write_text(json.dumps(data))
+    assert main(["run", "-j", "4"]) == 0
+    assert "running the other 2" in capsys.readouterr().out
+    data = json.loads(state.read_text())
+    assert {m["id"]: m["status"] for m in data["mutants"]} == EXPECTED
+
+    assert main(["run", "-j", "4"]) == 0
+    assert "nothing to run" in capsys.readouterr().out
 
 
 def test_rerun_single_mutant_after_adding_a_test(project, capsys):
@@ -146,6 +163,8 @@ def test_rerun_single_mutant_after_adding_a_test(project, capsys):
         assert main(["run", "-j", "4", "mylib.mathx.Counter.tick"]) == 0
         out = capsys.readouterr().out
         assert "2 mutants: 2 killed" in out
+        # test_tricky doesn't reach Counter.tick and didn't change
+        assert "building the 1 of 2 test files" in out
         data = json.loads((project / "mutants" / "despell.json").read_text())
         statuses = {m["id"]: m["status"] for m in data["mutants"]}
         # untouched mutants keep their earlier results

@@ -62,7 +62,15 @@ timeout_multiplier = 10.0
 timeout_floor = 2.0
 ```
 
-Results live in `mutants/despell.json`. Delete `mutants/` to start over.
+Results live in `mutants/despell.json`, saved as the run goes. A plain
+`despell run` only runs mutants without a result, so an interrupted run
+continues where it stopped; a change to the tests makes it run everything
+again. Delete `mutants/` to start over.
+
+despell copies the project into `mutants/` (minus version control,
+environments and caches) and runs the tests there. It puts a `.gitignore`
+in `mutants/` unless the project already ignores it; add `mutants/` to
+your own `.gitignore` if your tests look at `.gitignore` files.
 
 ## How it works
 

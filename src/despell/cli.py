@@ -41,6 +41,11 @@ Workflow:
   ... write or strengthen a test that would fail with the mutant applied ...
   despell run <id> [<id> ...]     re-check just those mutants
 
+A plain `despell run` only runs mutants without a result, so an interrupted
+run continues where it stopped, and changed code is re-checked. Changing
+anything under tests_dir makes it run every mutant again. Delete mutants/ to
+start over.
+
 Selectors for `run`, `results` and `show`: a mutant id (mylib.math.clamp.2),
 a function or module prefix (mylib.math.clamp, mylib.math), a glob
 ('mylib.*.clamp.*'), a source file (src/mylib/math.mojo) or file:line.
@@ -48,10 +53,10 @@ a function or module prefix (mylib.math.clamp, mylib.math), a glob
 Statuses:
   killed         a test failed with the mutant applied (good)
   survived       all covering tests passed: add or improve a test
-  no_tests       no test executes this function: add a test
+  no_tests       no test executes this code: add a test
   timeout        tests hung with the mutant applied (counts as killed)
   compile_error  the mutant doesn't compile (counts as killed)
-  skipped        the function can't hold mutation schemata (e.g. evaluated at compile time)
+  skipped        the function can't hold mutation schemata
 
 Equivalent mutants (that can't be killed) can be silenced by adding
 `# pragma: no mutate` to the line, or to the `def` line for a whole function.
@@ -166,7 +171,10 @@ def cmd_show(args) -> int:
     _, tests = load_state(config)
     out = []
     for m in mutants:
-        covering = [t.id for t in tests.values() if m.fid in t.functions]
+        if m.site is None:
+            covering = [t.id for t in tests.values() if m.fid in t.functions]
+        else:
+            covering = [t.id for t in tests.values() if m.site in t.sites]
         entry = asdict(m) | {"diff": mutant_diff(m, config.root), "covering_tests": covering}
         out.append(entry)
     if args.json:
@@ -182,7 +190,8 @@ def cmd_show(args) -> int:
         if m.detail:
             print(f"  detail: {m.detail}")
         tests_line = ", ".join(e["covering_tests"]) if e["covering_tests"] else "none"
-        print(f"  tests reaching {m.function}: {tests_line}")
+        reaching = m.function if m.site is None else f"line {m.line}"
+        print(f"  tests reaching {reaching}: {tests_line}")
         print(e["diff"].rstrip("\n"))
     return 0
 

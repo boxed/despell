@@ -51,6 +51,10 @@ def test_strings_but_not_messages():
     assert mutations('x = "a"\nraise Error("bad")\nprint("hi")\n') == ['`"a"` -> `"XXaXX"`']
 
 
+def test_symbol_names_are_not_mutated():
+    assert mutations('var r = external_call["chdir", Int32](d["k"])\n') == ['`"k"` -> `"XXkXX"`']
+
+
 def test_break_continue_and_min_max():
     assert mutations("while True:\n    break\nreturn min(a, b)\n") == [
         "`True` -> `False`", "`break` -> `continue`", "`min` -> `max`",
@@ -106,13 +110,16 @@ def test_generate_schemata():
     tokenize(text)  # still tokenizes
     # Only the statement holding a mutation is duplicated. Statements inside a
     # duplicated block get their own dispatch only in the original copy, since
-    # just one mutant is active at a time.
+    # just one mutant is active at a time. Each records that it ran, for
+    # coverage, except an `elif`, which nothing can go before.
     assert text[text.index("def f(") :] == '''\
 def f(xs: List[Int], k: Int) -> Int:
     """Doc."""
     var despell_m_ = _despell_active(0)
     @parameter
     def helper(y: Int) -> Int:
+        if _despell_active(0) == -1:
+            _despell_site(1)
         if _despell_active(0) == 1:
             return y / 2
         elif _despell_active(0) == 2:
@@ -120,11 +127,15 @@ def f(xs: List[Int], k: Int) -> Int:
         else:
             return y * 2
 
+    if despell_m_ == -1:
+        _despell_site(3)
     var total = (
             (k - 1) if despell_m_ == 3 else
             (k + 2) if despell_m_ == 4 else
             (k + 1))
     for x in xs:
+        if despell_m_ == -1:
+            _despell_site(5)
         if despell_m_ == 5:
             if x >= k:
                 total += x
@@ -132,6 +143,8 @@ def f(xs: List[Int], k: Int) -> Int:
                 break
         else:
             if x > k:
+                if despell_m_ == -1:
+                    _despell_site(6)
                 if despell_m_ == 6:
                     total -= x
                 elif despell_m_ == 7:
@@ -142,6 +155,8 @@ def f(xs: List[Int], k: Int) -> Int:
                     (x != 0) if despell_m_ == 8 else
                     (x == 1) if despell_m_ == 9 else
                     (x == 0)):
+                if despell_m_ == -1:
+                    _despell_site(10)
                 if despell_m_ == 10:
                     continue
                 else:
@@ -210,6 +225,30 @@ def f(a: Int, b: Int) -> Int:
             # every mutant's region holds its mutated code
             m = next(gm.mutation for f in gen.functions for gm in f.mutants if gm.number == r.mutant)
             assert any(m.replacement in line for line in lines[r.start : r.end + 1]), (r, m)
+
+
+def test_wrapped_expressions_stay_inside_their_block():
+    # the `if` is duplicated, and the `var` in its original copy is wrapped
+    # one level deeper; Mojo rejects a continuation line dedented past it
+    src = '''\
+def f(a: Int, b: Int) -> Bool:
+    if not a and b > 1:
+        var ok = (
+            a > 0
+            and b < 1
+        )
+        return ok
+    return False
+'''
+    lines = generate(src, analyze(src), first_fid=0, first_mutant=1, n_functions_total=1).text.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.lstrip().startswith("var ok = (")]
+    assert starts
+    for i in starts:
+        indent = len(lines[i]) - len(lines[i].lstrip())
+        j = i + 1
+        while not lines[j].lstrip().startswith("return ok"):
+            assert len(lines[j]) - len(lines[j].lstrip()) >= indent, lines[j]
+            j += 1
 
 
 def test_semicolons_and_nested_defs_in_compound_statements_are_left_alone():

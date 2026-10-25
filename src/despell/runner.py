@@ -11,6 +11,7 @@ Phases:
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import hashlib
 import json
@@ -30,6 +31,11 @@ from .tokenizer import TokenizeError, tokenize
 STATE_FILE = "despell.json"
 WORK_DIR = ".despell"
 STATS_MODE = "-1"
+# version control, environments and caches: big, and no test reads them
+NOT_COPIED = (
+    "mutants", ".git", ".hg", ".jj", ".svn", ".pixi", ".venv", ".magic",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store",
+)
 
 KILLED = "killed"
 SURVIVED = "survived"
@@ -65,6 +71,8 @@ class MutantRecord:
     status: str = NOT_CHECKED
     killed_by: str | None = None
     detail: str | None = None
+    # the statement holding the mutant, for coverage (None: use the function's)
+    site: int | None = None
 
 
 @dataclass
@@ -75,6 +83,7 @@ class TestRecord:
     binary: str = ""
     duration: float = 0.0
     functions: list[int] = field(default_factory=list)
+    sites: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -206,6 +215,53 @@ def absolutize_imports(text: str, package: tuple[str, ...]) -> str:
     return _RELATIVE_IMPORT.sub(sub, text)
 
 
+@dataclass
+class Exported:
+    """A module with its functions marked `@export`, for the pre-check."""
+
+    text: str
+    inserted: list[int]  # lines of the inserted decorators, ascending
+    by_line: dict[int, int]  # decorator line and def line -> function ordinal
+
+    def original_line(self, line: int) -> int:
+        """Line number in the text before the decorators were inserted."""
+        return line - bisect.bisect_left(self.inserted, line)
+
+
+def add_exports(text: str, skip: set[int]) -> Exported:
+    """Mark every function `@export`, except the ordinals in `skip`.
+
+    Mojo only instantiates what's reachable from `main` and exported
+    functions, and stops at the first failure under each of them. Exporting
+    every function makes each one its own root, so a single build reports an
+    instantiation error for every function that has one. Functions are
+    numbered by the order of their `def`s, leaving out despell's own, so the
+    numbers match between the original and the generated module.
+    """
+    lines = text.splitlines(keepends=True)
+    defs = []
+    for ll in tokenize(text).logical_lines:
+        t = ll.tokens
+        if len(t) > 1 and t[0].text == "def" and not t[1].text.startswith("_despell"):
+            defs.append(ll.first_line)
+    out = []
+    inserted = []
+    by_line = {}
+    prev = 0
+    for ordinal, def_line in enumerate(defs):
+        out += lines[prev:def_line]
+        prev = def_line
+        if ordinal in skip:
+            continue
+        indent = lines[def_line][: len(lines[def_line]) - len(lines[def_line].lstrip())]
+        inserted.append(len(out))
+        by_line[len(out)] = ordinal
+        by_line[len(out) + 1] = ordinal
+        out.append(f'{indent}@export("despell_x_{ordinal}")\n')
+    out += lines[prev:]
+    return Exported("".join(out), inserted, by_line)
+
+
 class Run:
     def __init__(self, config: Config, *, workers: int):
         self.config = config
@@ -228,16 +284,32 @@ class Run:
         cfg = self.config
         if self.mdir.exists():
             for child in self.mdir.iterdir():
-                if child.name in (STATE_FILE, WORK_DIR):
+                # an editor's environment in here is expensive to recreate,
+                # and something else may be writing to it (Finder, say)
+                if child.name in (STATE_FILE, WORK_DIR) or child.name in NOT_COPIED:
                     continue
-                shutil.rmtree(child) if child.is_dir() else child.unlink()
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
         self.mdir.mkdir(exist_ok=True)
-        (self.mdir / ".gitignore").write_text("*\n")
+        # keep mutants/ out of git, unless the project already does: tests
+        # that honor .gitignore (a file tree, say) would see an empty project
+        try:
+            already_ignored = subprocess.run(
+                ["git", "check-ignore", "-q", "mutants/"], cwd=cfg.root, capture_output=True
+            ).returncode == 0
+        except FileNotFoundError:
+            already_ignored = False
+        if already_ignored:
+            (self.mdir / ".gitignore").unlink(missing_ok=True)
+        else:
+            (self.mdir / ".gitignore").write_text("*\n")
         if self.work.exists():
             shutil.rmtree(self.work)
         (self.work / "bin").mkdir(parents=True)
 
-        ignore = shutil.ignore_patterns(".*", "mutants", "__pycache__")
+        ignore = shutil.ignore_patterns(*NOT_COPIED)
         for p in [*cfg.paths_to_mutate, cfg.tests_dir, *cfg.also_copy]:
             src = cfg.root / p
             dst = self.mdir / p
@@ -245,7 +317,7 @@ class Run:
                 raise RunError(f"path does not exist: {p}")
             if src.resolve() == cfg.root.resolve():
                 for child in src.iterdir():
-                    if child.name.startswith(".") or child.name == "mutants":
+                    if child.name in NOT_COPIED:
                         continue
                     if child.is_dir():
                         shutil.copytree(child, self.mdir / child.name, ignore=ignore, dirs_exist_ok=True)
@@ -274,6 +346,11 @@ class Run:
             self.files.append(sf)
             lines = source.splitlines(keepends=True)
             for f in functions:
+                # a statement is known by its first mutant's number
+                site_of: list[int | None] = []
+                for site in f.sites:
+                    key = number + len(site_of)
+                    site_of += [key if site.hook else None] * len(site.mutations)
                 for index, m in enumerate(f.mutations, start=1):
                     desc = m.describe()
                     self.mutants[number] = MutantRecord(
@@ -289,6 +366,7 @@ class Run:
                         original=m.original,
                         replacement=m.replacement,
                         fingerprint=_fingerprint(lines, f, desc, m.line),
+                        site=site_of[index - 1],
                     )
                     number += 1
                 fid += 1
@@ -306,21 +384,27 @@ class Run:
         root = root or self.mdir
         generated = {}
         for sf in self.files:
-            gen = generate(
-                sf.source,
-                sf.functions,
-                first_fid=sf.first_fid,
-                first_mutant=sf.first_mutant,
-                n_functions_total=self.n_functions,
-                enabled=enabled,
-                disabled_functions=disabled_functions,
-                dispatch_only=dispatch_only,
-                no_inline=True,
-            )
+            gen = self._generate(sf, enabled, disabled_functions, dispatch_only)
             path = root / sf.rel
             path.write_text(gen.text)
             generated[path.resolve()] = gen
         return generated
+
+    def _generate(
+        self, sf: SourceFile, enabled: set[int], disabled_functions: set[int], dispatch_only: set[int] = frozenset()
+    ) -> GeneratedFile:
+        return generate(
+            sf.source,
+            sf.functions,
+            first_fid=sf.first_fid,
+            first_mutant=sf.first_mutant,
+            n_functions_total=self.n_functions,
+            n_mutants_total=len(self.mutants) + 1,
+            enabled=enabled,
+            disabled_functions=disabled_functions,
+            dispatch_only=dispatch_only,
+            no_inline=True,
+        )
 
     def _binary_for(self, test_file: str) -> Path:
         return self.work / "bin" / test_file.replace("/", "__").removesuffix(".mojo")
@@ -338,6 +422,9 @@ class Run:
             output = output.with_suffix(".ll")
         cmd += [*self.config.build_args, test_file, "-o", str(output)]
         proc = subprocess.run(cmd, cwd=root or self.mdir, env=self.mojo.env, capture_output=True, text=True)
+        if emit != "exe":
+            # only the errors are wanted, and the IR can be gigabytes
+            output.unlink(missing_ok=True)
         return test_file, proc.returncode, proc.stdout + proc.stderr
 
     def _slot_build(
@@ -420,17 +507,22 @@ class Run:
         )
 
     def _precheck(self, enabled: set[int], disabled_functions: set[int]):
-        """Find type errors fast by checking each mutated module on its own.
+        """Find compile errors fast by checking each mutated module on its own.
 
         Mojo only type-checks function bodies that are referenced, except in
         the file being compiled, where it checks everything. So compiling each
         module as its own entry point checks all of its mutants while touching
         only what it imports, in parallel and much faster than the test builds.
-        That needs relative imports made absolute. Checking a module this way
-        reports some errors normal builds never see (code nothing references,
-        a type existing twice), so errors that the unmutated module also gets
-        are ignored. This only catches type errors: errors that need generic
-        code instantiated are left to the test builds.
+        That needs relative imports made absolute. Imports come from the
+        original project: a mutant that breaks an imported module would stop
+        the build before it gets to instantiating anything. Errors that only show when
+        generic code is instantiated (a `comptime assert` in the stdlib, say)
+        need the functions instantiated, so every function is marked
+        `@export` (see `add_exports`). Checking a module this way reports some
+        errors normal builds never see (code nothing references, a type
+        existing twice, a function that can't be exported), so the unmutated
+        module is checked first: functions that can't be exported aren't, and
+        statements that fail without mutants are left alone.
         """
         files = [sf for sf in self.files if any(gm in enabled for gm in self._numbers(sf))]
         if not files:
@@ -438,55 +530,116 @@ class Run:
         t0 = time.monotonic()
         check_dir = self.work / "check"
         check_dir.mkdir(exist_ok=True)
-        self.write_schemata(enabled, disabled_functions)
+        # imports resolve against the original project, so each module is
+        # checked with its own mutants and no one else's
+        root = self.config.root
+        project_files = {(root / sf.rel).resolve() for sf in self.files}
 
-        def check(sf: SourceFile, text: str, suffix: str) -> list[tuple[int, str]]:
+        def check(sf: SourceFile, text: str, suffix: str, skip: set[int]):
+            """Returns the module with exports, and the error chains it gets."""
             assert self.mojo
+            exported = add_exports(text, skip)
             path = check_dir / f"{sf.module}{suffix}.mojo"
-            path.write_text(absolutize_imports(text, sf.package))
-            cmd = [*self.mojo.command, "build", "--disable-warnings", "--emit", "llvm"]
+            path.write_text(absolutize_imports(exported.text, sf.package))
+            cmd = [*self.mojo.command, "build", "--disable-warnings", "--emit", "llvm", "--elaboration-error-limit=0"]
             for inc in self.config.include_dirs:
                 cmd += ["-I", inc]
             cmd += [*self.config.build_args, str(path), "-o", str(path.with_suffix(".ll"))]
-            proc = subprocess.run(cmd, cwd=self.mdir, env=self.mojo.env, capture_output=True, text=True)
-            errors = []
+            proc = subprocess.run(cmd, cwd=root, env=self.mojo.env, capture_output=True, text=True)
+            path.with_suffix(".ll").unlink(missing_ok=True)
+            path = path.resolve()
+            chains = []
             for m in self._DIAG_RE.finditer(proc.stdout + proc.stderr):
-                if m.group(4) == "error" and (self.mdir / m.group(1)).resolve() == path.resolve():
-                    errors.append((int(m.group(2)) - 1, m.group(5)))
-            return errors
+                if m.group(4) == "error":
+                    chains.append([])
+                if not chains:
+                    continue
+                frame_path = (root / m.group(1)).resolve()
+                where = "here" if frame_path == path else "project" if frame_path in project_files else "other"
+                chains[-1].append((where, int(m.group(2)) - 1, m.group(5)))
+            return exported, chains
+
+        def culprit(chain) -> int | None:
+            """The line in the checked module to blame for an error, if any."""
+            if chain[0][2].startswith("function instantiation failed"):
+                # deepest frame in the project's code; if that's in another
+                # module, the error is that module's to report
+                for where, line, _ in reversed(chain):
+                    if where == "here":
+                        return line
+                    if where == "project":
+                        return None
+                return None
+            return chain[0][1] if chain[0][0] == "here" else None
+
+        def check_baseline(sf: SourceFile) -> tuple[set[int], set[int]]:
+            skip: set[int] = set()
+            for _ in range(10):
+                exported, chains = check(sf, sf.source, ".orig", skip)
+                lines = {line for chain in chains if (line := culprit(chain)) is not None}
+                failing_exports = {exported.by_line[line] for line in lines if line in exported.by_line}
+                if not failing_exports:
+                    break
+                skip |= failing_exports
+            return skip, {exported.original_line(line) for line in lines}
 
         with ThreadPoolExecutor(self.workers) as pool:
-            baseline = dict(zip(
-                [sf.rel for sf in files],
-                pool.map(lambda sf: {line for line, _ in check(sf, sf.source, ".orig")}, files),
-            ))
+            baseline = dict(zip([sf.rel for sf in files], pool.map(check_baseline, files)))
         rejected = 0
         todo = files
+        round_log = []
         for round_no in range(1, 100):
             if not todo:
                 break
-            generated = self.write_schemata(enabled, disabled_functions)
-            texts = [(sf, generated[(self.mdir / sf.rel).resolve()]) for sf in todo]
+            t_round = time.monotonic()
+            # Mojo reports one instantiation error per function, so a module
+            # can take a round per bad mutant. When few modules are left,
+            # their mutants are split over several checks to find more at once.
+            parts = max(1, self.workers // len(todo))
+            jobs = []
+            for sf in todo:
+                mine = [n for n in self._numbers(sf) if n in enabled]
+                k = max(1, min(parts, len(mine)))
+                for i in range(k):
+                    jobs.append((sf, set(mine[i::k]), f".p{i}" if k > 1 else ""))
+
+            def run_job(job):
+                sf, subset, suffix = job
+                gen = self._generate(sf, subset, disabled_functions)
+                return gen, check(sf, gen.text, suffix, baseline[sf.rel][0])
+
             with ThreadPoolExecutor(self.workers) as pool:
-                results = list(pool.map(lambda item: check(item[0], item[1].text, ""), texts))
-            todo = []
-            for (sf, gen), errors in zip(texts, results):
+                results = list(pool.map(run_job, jobs))
+            found_in: dict[str, int] = {}
+            for (sf, subset, _), (gen, (exported, chains)) in zip(jobs, results):
                 found = 0
-                for line, msg in errors:
+                for chain in chains:
+                    line = culprit(chain)
+                    if line is None:
+                        continue
+                    line = exported.original_line(line)
                     region = next(
                         (r for r in gen.regions if r.mutant is not None and r.start <= line <= r.end), None
                     )
-                    if region is None or region.mutant not in enabled:
+                    if region is None or region.mutant not in enabled or region.mutant not in subset:
                         continue
                     # the statement fails without the mutant too: not the mutant's fault
-                    if any(region.orig[0] <= b <= region.orig[1] for b in baseline[sf.rel]):
+                    if any(region.orig[0] <= b <= region.orig[1] for b in baseline[sf.rel][1]):
                         continue
-                    self._reject(region.mutant, msg, enabled)
+                    instantiation = chain[0][2].startswith("function instantiation failed")
+                    self._reject(region.mutant, chain[-1][2] if instantiation else chain[0][2], enabled)
                     found += 1
-                if found:
-                    rejected += found
-                    # errors hidden behind the ones just fixed may surface now
-                    todo.append(sf)
+                found_in[sf.rel] = found_in.get(sf.rel, 0) + found
+            # errors hidden behind the ones just found may surface now
+            todo = [sf for sf in todo if found_in.get(sf.rel)]
+            rejected += sum(found_in.values())
+            round_log.append(
+                f"round {round_no}: {len(jobs)} checks of {len(found_in)} modules in "
+                f"{time.monotonic() - t_round:.1f}s: {sum(found_in.values())} rejected "
+                + " ".join(f"{rel}={n}" for rel, n in found_in.items() if n)
+            )
+        (self.work / "logs").mkdir(exist_ok=True)
+        (self.work / "logs" / "precheck.txt").write_text("\n".join(round_log) + "\n")
         log(
             f"pre-checked {len(files)} modules in {time.monotonic() - t0:.1f}s "
             f"({round_no - 1} rounds): {rejected} mutants don't compile"
@@ -617,6 +770,10 @@ class Run:
 
     _DIAG_RE = re.compile(r"^(?:Imported from .*\n)?(.+?\.mojo):(\d+):(\d+): (error|note): (.*)$", re.MULTILINE)
 
+    # a function referencing an undefined symbol, in the linker's output:
+    #     _pkg::mod::Struct::method(::String) in mojo_archive-a8b61e5.a
+    _LINK_REF_RE = re.compile(r"^\s+_([\w:]+)\(.* in \S+\.a$", re.MULTILINE)
+
     def _attribute_errors(self, failures, generated):
         """Map compiler errors to mutants, statements and functions.
 
@@ -626,6 +783,8 @@ class Run:
         when the failure is in code it calls (a SIMD width of 33, say), or the
         `def` of the function holding the bad mutant. The "call expansion
         failed" notes on the way point at callers, which aren't to blame.
+        Linker errors have no location, but name the functions referencing
+        a missing symbol.
         """
         mutant_hits: dict[int, str] = {}
         site_hits: dict[tuple[int, ...], str] = {}
@@ -665,6 +824,11 @@ class Run:
                     else:
                         function_hits.add(region.fid)
                     break
+            fids = {m.id.rsplit(".", 1)[0]: m.fid for m in self.mutants.values()}
+            for symbol in self._LINK_REF_RE.findall(out):
+                fid = fids.get(symbol.replace("::", "."))
+                if fid is not None:
+                    function_hits.add(fid)
         return mutant_hits, site_hits, function_hits
 
     # ---- phase 3: stats ------------------------------------------------------
@@ -690,6 +854,7 @@ class Run:
             t.binary = str(self._binary_for(t.file).relative_to(self.mdir))
             t.duration = duration
             t.functions = sorted({int(x) for x in re.findall(r"^despell-hit (\d+)$", out, re.MULTILINE)})
+            t.sites = sorted({int(x) for x in re.findall(r"^despell-site (\d+)$", out, re.MULTILINE)})
             return t, code, out
 
         t0 = time.monotonic()
@@ -705,8 +870,17 @@ class Run:
 
     # ---- phase 4: mutants ----------------------------------------------------
 
-    def run_mutant(self, m: MutantRecord, tests_by_fid: dict[int, list[TestRecord]]):
-        tests = tests_by_fid.get(m.fid, [])
+    def run_mutant(self, m: MutantRecord, tests_by_fid: dict[int, list[TestRecord]], tests_by_site=None):
+        t0 = time.monotonic()
+        runs: list[int] = []  # tests per process started
+        try:
+            # only the tests that run the mutant's statement can kill it
+            tests = tests_by_fid.get(m.fid, []) if m.site is None else (tests_by_site or {}).get(m.site, [])
+            self._run_mutant(m, tests, runs)
+        finally:
+            self.timings.append((m.id, m.status, len(runs), sum(runs), time.monotonic() - t0))
+
+    def _run_mutant(self, m: MutantRecord, tests: list[TestRecord], runs: list[int]):
         if not tests:
             m.status = NO_TESTS
             m.killed_by = None
@@ -715,16 +889,24 @@ class Run:
         tests = sorted(tests, key=lambda t: t.duration)
         # One failing test is enough, but a TestSuite runs all the tests it's
         # given. Most mutants that get killed fail the first test they meet, so
-        # the fastest test runs on its own before the rest are run together.
+        # the fastest test runs on its own, then the rest in batches that
+        # double in size: a killed mutant stops early, and a survivor only
+        # pays for a few more process starts (milliseconds each).
         batches: list[tuple[str, list[TestRecord]]] = [(tests[0].file, tests[:1])]
         by_binary: dict[str, list[TestRecord]] = {}
         for t in tests[1:]:
             by_binary.setdefault(t.file, []).append(t)
-        batches += sorted(by_binary.items(), key=lambda kv: sum(t.duration for t in kv[1]))
+        for file, ts in sorted(by_binary.items(), key=lambda kv: sum(t.duration for t in kv[1])):
+            size = 2
+            while ts:
+                batches.append((file, ts[:size]))
+                ts = ts[size:]
+                size *= 2
         for file, ts in batches:
             names = [t.name for t in ts] if ts[0].name else None
             budget = sum(t.duration for t in ts)
             timeout = max(self.config.timeout_floor, budget * self.config.timeout_multiplier)
+            runs.append(len(ts))
             code, _, out = self._run_test_binary(
                 self._binary_for(file), names, {"DESPELL_MUTANT": str(m.number)}, timeout
             )
@@ -743,25 +925,51 @@ class Run:
         m.killed_by = None
         m.detail = None
 
-    def run_mutants(self, selected: list[MutantRecord]):
+    def _write_timings(self):
+        lines = ["id\tstatus\tprocesses\ttests\tseconds"]
+        lines += [f"{i}\t{st}\t{p}\t{n}\t{sec:.3f}" for i, st, p, n, sec in list(self.timings)]
+        (self.work / "logs").mkdir(exist_ok=True)
+        (self.work / "logs" / "mutants.tsv").write_text("\n".join(lines) + "\n")
+
+    def run_mutants(self, selected: list[MutantRecord], checkpoint=None):
+        """Run the mutants; `checkpoint(ids)` is called now and then with the
+        ids of the mutants done so far, to save them."""
         tests_by_fid: dict[int, list[TestRecord]] = {}
+        tests_by_site: dict[int, list[TestRecord]] = {}
         for t in self.tests:
             for fid in t.functions:
                 tests_by_fid.setdefault(fid, []).append(t)
+            for site in t.sites:
+                tests_by_site.setdefault(site, []).append(t)
         todo = [m for m in selected if m.status not in (COMPILE_ERROR, SKIPPED)]
         if not todo:
             return
         log(f"running {len(todo)} mutants with {self.workers} workers")
+        self.timings: list[tuple[str, str, int, int, float]] = []
         t0 = time.monotonic()
-        last_report = t0
+        last_report = last_save = t0
         done = 0
-        with ThreadPoolExecutor(self.workers) as pool:
-            for _ in pool.map(lambda m: self.run_mutant(m, tests_by_fid), todo):
+        pool = ThreadPoolExecutor(self.workers)
+        try:
+            for _ in pool.map(lambda m: self.run_mutant(m, tests_by_fid, tests_by_site), todo):
                 done += 1
                 now = time.monotonic()
                 if now - last_report > 10 and done < len(todo):
                     log(f"  {done}/{len(todo)} mutants done")
                     last_report = now
+                if checkpoint and now - last_save > 60:
+                    checkpoint({m.id for m in todo[:done]})
+                    last_save = now
+        except KeyboardInterrupt:
+            # don't wait for the mutants still queued; keep what's done
+            pool.shutdown(wait=False, cancel_futures=True)
+            if checkpoint:
+                checkpoint({m.id for m in todo[:done]})
+            self._write_timings()
+            log(f"interrupted after {done}/{len(todo)} mutants; `despell run` continues from there")
+            raise
+        pool.shutdown()
+        self._write_timings()
         elapsed = time.monotonic() - t0
         log(f"ran {len(todo)} mutants ({elapsed:.1f}s, {len(todo) / max(elapsed, 1e-9):.0f}/s)")
 
@@ -783,9 +991,27 @@ def load_state(config: Config) -> tuple[dict[str, MutantRecord], dict[str, TestR
     return mutants, tests
 
 
-def save_state(config: Config, mutants: list[MutantRecord], tests: list[TestRecord]):
+def load_tests_hash(config: Config) -> str | None:
+    path = state_path(config)
+    return json.loads(path.read_text()).get("tests_hash") if path.exists() else None
+
+
+def load_test_hashes(config: Config) -> dict:
+    path = state_path(config)
+    return json.loads(path.read_text()).get("test_hashes", {}) if path.exists() else {}
+
+
+def save_state(
+    config: Config,
+    mutants: list[MutantRecord],
+    tests: list[TestRecord],
+    tests_hash: str | None = None,
+    test_hashes: dict | None = None,
+):
     data = {
         "version": 1,
+        "tests_hash": tests_hash,
+        "test_hashes": test_hashes or {},
         "mutants": [asdict(m) for m in sorted(mutants, key=lambda m: m.number)],
         "tests": [asdict(t) for t in tests],
     }
@@ -809,14 +1035,78 @@ def matches(m: MutantRecord, selectors: list[str]) -> bool:
     return False
 
 
+def tests_fingerprint(config: Config) -> str:
+    """A hash of everything in the tests directory: results from a run with
+    other tests can't be trusted."""
+    h = hashlib.sha256()
+    tests_root = config.root / config.tests_dir
+    for path in sorted(tests_root.rglob("*")):
+        if path.is_file() and not any(part in NOT_COPIED for part in path.relative_to(tests_root).parts):
+            h.update(str(path.relative_to(tests_root)).encode() + b"\0" + path.read_bytes() + b"\0")
+    return h.hexdigest()[:16]
+
+
+def test_file_hashes(config: Config, test_files: set[str]) -> dict[str, str]:
+    """A hash per test file, and one ("*") for the rest of the tests
+    directory (shared helpers, fixtures), which every test file may use."""
+    tests_root = config.root / config.tests_dir
+    rest = hashlib.sha256()
+    hashes = {}
+    for path in sorted(tests_root.rglob("*")):
+        if not path.is_file() or any(part in NOT_COPIED for part in path.relative_to(tests_root).parts):
+            continue
+        rel = str(path.relative_to(config.root))
+        if rel in test_files:
+            hashes[rel] = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        else:
+            rest.update(rel.encode() + b"\0" + path.read_bytes() + b"\0")
+    hashes["*"] = rest.hexdigest()[:16]
+    return hashes
+
+
+def _needed_test_files(
+    selected: list[MutantRecord], old_tests: dict[str, TestRecord], old_hashes: dict, hashes: dict
+) -> set[str] | None:
+    """The test files that can kill the selected mutants, or None for all.
+
+    Those whose tests ran the mutants' code last time, and the ones changed
+    since, which may now. Coverage is by mutant and function numbers, which
+    only hold while the sources are the same.
+    """
+    if not old_tests or old_hashes.get("sources") != hashes["sources"] or old_hashes.get("*") != hashes["*"]:
+        return None
+    needed = {f for f, h in hashes.items() if f not in ("*", "sources") and old_hashes.get(f) != h}
+    for t in old_tests.values():
+        if t.file in needed:
+            continue
+        for m in selected:
+            if (m.site in t.sites) if m.site is not None else (m.fid in t.functions):
+                needed.add(t.file)
+                break
+    return needed
+
+
+# a mutant with one of these from an earlier run, and the same code and tests,
+# isn't run again
+FINAL = {KILLED, SURVIVED, TIMEOUT, NO_TESTS}
+
+
 def run(config: Config, *, selectors: list[str], workers: int) -> list[MutantRecord]:
-    previous, _ = load_state(config)
+    """Run the selected mutants, or, without selectors, the ones without a
+    result yet. Returns the selected mutants, or all of them."""
+    previous, old_tests = load_state(config)
+    tests_hash = tests_fingerprint(config)
+    tests_changed = previous and load_tests_hash(config) != tests_hash
     r = Run(config, workers=workers)
     t0 = time.monotonic()
     r.prepare()
-    r.tests = discover_tests(config)
-    if not r.tests:
+    all_tests = discover_tests(config)
+    if not all_tests:
         raise RunError(f"no test files found in {config.tests_dir}")
+    r.tests = all_tests
+    all_files = {t.file for t in all_tests}
+    hashes = test_file_hashes(config, all_files)
+    hashes["sources"] = hashlib.sha256("\0".join(sf.source for sf in r.files).encode()).hexdigest()[:16]
     log(
         f"generated {len(r.mutants)} mutants in {r.n_functions} functions "
         f"across {len(r.files)} files; {len(r.tests)} tests"
@@ -827,24 +1117,52 @@ def run(config: Config, *, selectors: list[str], workers: int) -> list[MutantRec
         if not selected:
             raise RunError(f"no mutants match {' '.join(selectors)}")
     else:
-        selected = list(r.mutants.values())
+        if tests_changed:
+            log("the tests changed since the last run: running every mutant again")
+            previous = {k: v for k, v in previous.items() if v.status not in FINAL}
 
-    # with selectors, only the selected mutants go into the build: a much
-    # smaller program, which is what makes the write-a-test/re-check loop fast
-    r.build(previous, only={m.number for m in selected} if selectors else None)
-    r.collect_stats()
-    r.run_mutants(selected)
+        def has_result(m: MutantRecord) -> bool:
+            old = previous.get(m.id)
+            return bool(old and old.fingerprint == m.fingerprint and old.status in FINAL | {COMPILE_ERROR, SKIPPED})
 
-    # keep results for mutants we didn't run this time, if they're unchanged
+        selected = [m for m in r.mutants.values() if not has_result(m)]
+        resumed = len(r.mutants) - len(selected)
+        if resumed:
+            log(f"{resumed} mutants have results from an earlier run; running the other {len(selected)}")
+
+    def save(fresh: set[str]):
+        """Save, keeping earlier results for the unchanged mutants not in `fresh`."""
+        mutants = []
+        for m in r.mutants.values():
+            old = previous.get(m.id)
+            if m.id not in fresh and m.status not in (COMPILE_ERROR, SKIPPED) and old and old.fingerprint == m.fingerprint:
+                m = MutantRecord(**{**asdict(m), "status": old.status, "killed_by": old.killed_by, "detail": old.detail})
+            mutants.append(m)
+        # tests that weren't run this time keep their coverage from before
+        ran = {t.file for t in r.tests}
+        kept = [t for t in old_tests.values() if t.file not in ran] if len(ran) < len(all_files) else []
+        save_state(config, mutants, r.tests + kept, tests_hash, hashes)
+        return mutants
+
     selected_ids = {m.id for m in selected}
-    for m in r.mutants.values():
-        if m.id in selected_ids or m.status in (COMPILE_ERROR, SKIPPED):
-            continue
-        old = previous.get(m.id)
-        if old and old.fingerprint == m.fingerprint:
-            m.status, m.killed_by, m.detail = old.status, old.killed_by, old.detail
+    if not selected:
+        log("nothing to run; pass mutant ids to run some again, or delete mutants/ to start over")
+        return save(fresh=set())
+    # only the selected mutants go into the build, and only the test files
+    # that can kill them get built: that's what makes the write-a-test,
+    # re-check loop fast
+    partial = len(selected) < len(r.mutants)
+    if partial:
+        needed = _needed_test_files(selected, old_tests, load_test_hashes(config), hashes)
+        if needed is not None:
+            r.tests = [t for t in all_tests if t.file in needed]
+            log(f"building the {len(needed)} of {len(all_files)} test files that can reach these mutants")
+    r.build(previous, only={m.number for m in selected} if partial else None)
+    # a long build's verdicts survive whatever goes wrong after it
+    save(fresh=set())
+    r.collect_stats()
+    r.run_mutants(selected, checkpoint=lambda done: save(fresh=done))
 
-    all_mutants = list(r.mutants.values())
-    save_state(config, all_mutants, r.tests)
+    all_mutants = save(fresh=selected_ids)
     log(f"done in {time.monotonic() - t0:.1f}s")
-    return [m for m in all_mutants if m.id in selected_ids]
+    return [m for m in all_mutants if m.id in selected_ids] if selectors else all_mutants

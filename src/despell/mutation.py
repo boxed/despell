@@ -102,6 +102,10 @@ _METHOD_SWAPS = {
 # produces survivors nobody cares about.
 _MESSAGE_CALLS = {"debug_assert", "abort", "print", "Error"}
 
+# Strings in the brackets after these name symbols: a mutant would compile
+# and then fail to link.
+_SYMBOL_PARAMS = {"external_call", "__mlir_attr", "__mlir_op", "__mlir_type"}
+
 
 @dataclass
 class Mutation:
@@ -147,6 +151,8 @@ class Site:
     expr: tuple[int, int, int, int] | None = None  # WRAP: (line, col, end_line, end_col)
     # DECL: the name, its type, and the columns of `var` and `=` on first_line
     decl: tuple[str, str, int, int] | None = None
+    # whether a coverage hook can go before the statement (not before `elif`)
+    hook: bool = True
 
 
 @dataclass
@@ -228,6 +234,8 @@ def mutations_for_logical_line(ll: LogicalLine) -> list[Mutation]:
     # bracket depth at which a `for` is waiting for its `in`
     pending_for: set[int] = set()
     depth = 0
+    # depth of the brackets after an `external_call` and the like, if inside
+    symbol_depth: int | None = None
     skip_next = False
     for i, tok in enumerate(toks):
         prev = toks[i - 1] if i > 0 else None
@@ -235,8 +243,12 @@ def mutations_for_logical_line(ll: LogicalLine) -> list[Mutation]:
 
         if tok.kind == OP and tok.text in "([{":
             depth += 1
+            if symbol_depth is None and tok.text == "[" and prev is not None and prev.text in _SYMBOL_PARAMS:
+                symbol_depth = depth
         elif tok.kind == OP and tok.text in ")]}":
             pending_for.discard(depth)
+            if depth == symbol_depth:
+                symbol_depth = None
             depth -= 1
 
         if skip_next:
@@ -253,7 +265,7 @@ def mutations_for_logical_line(ll: LogicalLine) -> list[Mutation]:
             if new is not None:
                 add(tok, new)
         elif tok.kind == STRING:
-            if not message_line:
+            if not message_line and symbol_depth is None:
                 new = _mutate_string(tok.text)
                 if new is not None and tok.line == tok.end_line:
                     add(tok, new)
@@ -410,7 +422,7 @@ def _make_site(
         if type_text is not None:
             decl = (toks[1].text, type_text, toks[0].col, eq_tok.col)
             return Site(DECL, ll.first_line, ll.last_line, indent, nested, inside, decl=decl)
-    return Site(WRAP, ll.first_line, ll.last_line, indent, nested, inside, expr=span)
+    return Site(WRAP, ll.first_line, ll.last_line, indent, nested, inside, expr=span, hook=first != "elif")
 
 
 def find_functions(src: TokenizedSource) -> list[Function]:
@@ -500,7 +512,28 @@ comptime _despell_mutant = _DespellGlobal["despell_mutant", _despell_init_mutant
 comptime _despell_hits = _DespellGlobal["despell_hits", _despell_init_hits]
 
 
+def _despell_init_sites() -> List[Bool]:
+    return List[Bool](length={n_mutants}, fill=False)
+
+
+comptime _despell_sites = _DespellGlobal["despell_sites", _despell_init_sites]
+
+
+def _despell_site(key: Int):
+    """Records that a statement holding mutants ran, in coverage mode."""
+    try:
+        var hits = _despell_sites.get_or_create_ptr()
+        if not hits[][key]:
+            hits[][key] = True
+            print("despell-site", key)
+    except:
+        pass
+
+
 def _despell_active(fid: Int) -> Int:
+    # code evaluated at compile time runs unmutated: globals don't exist there
+    if __is_run_in_comptime_interpreter:
+        return 0
     try:
         var m = _despell_mutant.get_or_create_ptr()[]
         if m == -1:
@@ -574,6 +607,7 @@ class _Emitter:
         self.lines = lines
         self.out: list[str] = []
         self.regions: list[Region] = []
+        self.site_keys: dict[int, int] = {}  # id(site) -> its first mutant's number
 
     def copy(self, lines: list[str], start: int, end: int, depth: int):
         """Copy physical lines, indented `depth` levels deeper."""
@@ -584,12 +618,34 @@ class _Emitter:
             else:
                 self.out.append(INDENT * depth + line)
 
+    def span(self, lines: list[str], sl: int, sc: int, el: int, ec: int, depth: int) -> str:
+        """The text from (sl, sc) to (el, ec), its later lines indented `depth`
+        levels deeper: Mojo rejects a continuation line, even in brackets,
+        that's dedented past the block it's in."""
+        if sl == el:
+            return lines[sl][sc:ec]
+        middle = []
+        for i in range(sl + 1, el + 1):
+            line = lines[i] if i < el else lines[el][:ec]
+            if i in self.src.in_string_lines or (i < el and not line.strip()):
+                middle.append(line)
+            else:
+                middle.append(INDENT * depth + line)
+        return lines[sl][sc:] + "".join(middle)
+
     def emit_range(self, start: int, end: int, depth: int, sites: list[tuple[Site, list[GeneratedMutant]]], ctx):
         pos = start
         for site, active in sites:
             if site.first_line < pos or site.first_line > end:
                 continue
             self.copy(self.lines, pos, site.first_line - 1, depth)
+            if site.hook:
+                # coverage per statement: a test that doesn't run it can't
+                # kill its mutants
+                _, mvar = ctx(site)
+                ind = INDENT * depth + site.indent
+                self.out.append(f"{ind}if {mvar} == -1:\n")
+                self.out.append(f"{ind}{INDENT}_despell_site({self.site_keys[id(site)]})\n")
             if site.kind == DUP:
                 self.emit_dup(site, active, depth, [s for s in sites if s[0] is not site], ctx)
             elif site.kind == DECL:
@@ -654,20 +710,16 @@ class _Emitter:
             m = gm.mutation
             mutated = _apply(self.lines, m)
             m_ec = ec + len(m.replacement) - (m.end_col - m.col) if m.line == el else ec
-            expr = _span_text(mutated, sl, sc, el, m_ec)
+            expr = self.span(mutated, sl, sc, el, m_ec, depth)
             first = len(self.out)
             self.out.extend(f"{cont}({expr}) if {mvar} == {gm.number} else\n".splitlines(keepends=True))
             self.regions.append(Region(first, len(self.out) - 1, fid, mutant=gm.number, orig=orig))
         tail = self.lines[el][ec:]
-        self.out.extend(f"{cont}({_span_text(self.lines, sl, sc, el, ec)})){tail}".splitlines(keepends=True))
+        self.out.extend(f"{cont}({self.span(self.lines, sl, sc, el, ec, depth)})){tail}".splitlines(keepends=True))
         self.copy(self.lines, el + 1, site.last_line, depth)
         self.regions.append(Region(start, len(self.out) - 1, fid, site=tuple(gm.number for gm in active), orig=orig))
 
 
-def _span_text(lines: list[str], sl: int, sc: int, el: int, ec: int) -> str:
-    if sl == el:
-        return lines[sl][sc:ec]
-    return lines[sl][sc:] + "".join(lines[sl + 1 : el]) + lines[el][:ec]
 
 
 def _inline_decorator(lines: list[str], def_line: int) -> int | None:
@@ -687,6 +739,7 @@ def generate(
     first_fid: int,
     first_mutant: int,
     n_functions_total: int,
+    n_mutants_total: int = 0,
     enabled: set[int] | None = None,
     disabled_functions: set[int] = frozenset(),
     dispatch_only: set[int] = frozenset(),
@@ -710,7 +763,8 @@ def generate(
 
     insert_at = _module_docstring_end(src)
     out.extend(lines[:insert_at])
-    out.extend((RUNTIME_HEADER.format(n_functions=max(n_functions_total, 1))).splitlines(keepends=True))
+    header = RUNTIME_HEADER.format(n_functions=max(n_functions_total, 1), n_mutants=max(n_mutants_total, 1))
+    out.extend(header.splitlines(keepends=True))
     pos = insert_at
 
     fid = first_fid
@@ -719,6 +773,7 @@ def generate(
         gen_mutants = []
         active_sites = []
         for site in f.sites:
+            em.site_keys[id(site)] = number
             active = []
             for m in site.mutations:
                 gm = GeneratedMutant(number=number, fid=fid, index=len(gen_mutants) + 1, mutation=m)
