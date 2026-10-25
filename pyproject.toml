@@ -1,0 +1,23 @@
+[project]
+name = "despell"
+version = "0.1.0"
+description = "Mutation testing for Mojo"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+despell = "despell.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--basetemp=tmp/pytest"
