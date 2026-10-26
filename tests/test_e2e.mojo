@@ -9,7 +9,7 @@ from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
 from despell.fsutil import copy_tree, join, read_text, real_path, rmtree, write_text, remove_file
 from despell.jsonio import Json, encode, parse
-from despell.sysutil import Finished, environment, run_command
+from despell.sysutil import Finished, environment, run_command, with_env
 
 comptime PROJECT = "tmp/e2e/simple"
 
@@ -17,12 +17,20 @@ comptime PROJECT = "tmp/e2e/simple"
 def despell(*args: String) raises -> String:
     """Run despell in the project; its output (failing on a non-zero exit)."""
     var argv = List[String]()
+    for a in args:
+        argv.append(a)
+    return despell_with(List[String](), argv)
+
+
+def despell_with(env: List[String], args: List[String]) raises -> String:
+    """`despell`, with `env` (NAME=value) added to the environment."""
+    var argv = List[String]()
     argv.append(real_path("build/despell"))
     for a in args:
         argv.append(a)
-    var r = run_command(argv, real_path(PROJECT), environment())
+    var r = run_command(argv, real_path(PROJECT), with_env(environment(), env))
     if r.code != 0:
-        raise Error("despell " + String(args[0]) + " exited with " + String(r.code) + ":\n" + r.output)
+        raise Error("despell " + args[0] + " exited with " + String(r.code) + ":\n" + r.output)
     return r.output
 
 
@@ -135,6 +143,22 @@ def test_6_new_test_file_is_checked_against_survivors_only() raises:
     var again = despell("run", "-j", "4")
     remove_file(new_file)
     assert_true("nothing to run" in again, again)
+
+
+def test_7_coverage_first() raises:
+    # from scratch, measuring coverage before building with mutants: each
+    # test binary only gets the mutants its tests reach, same results
+    rmtree(PROJECT)
+    var skip = List[String]()
+    skip.append("mutants")
+    copy_tree("e2e_projects/simple", PROJECT, skip)
+    var out = despell_with([String("DESPELL_COVERAGE_FIRST=0")], [String("run"), String("-j"), String("4")])
+    assert_true("measured coverage first, building 2 test files" in out, out)
+    assert_expected()
+    var files = parse(read_text(join(PROJECT, "mutants/.despell/bin/manifest.json"))).get("files")
+    var a = len(files.get("tests/test_mathx.mojo").int_list("enabled"))
+    var b = len(files.get("tests/test_tricky.mojo").int_list("enabled"))
+    assert_true(a > 0 and b > 0 and a + b < 70, String(a) + " " + String(b))
 
 
 def main() raises:

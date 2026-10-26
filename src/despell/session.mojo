@@ -1,6 +1,7 @@
 """A `despell run`: what to run, the coverage and mutant phases, and saving."""
 
 from std.collections import Dict, Set
+from std.os import getenv
 
 from .fsutil import join, mkdirs, rmtree, write_text, hash_text
 from .project import Config
@@ -14,6 +15,10 @@ from .sysutil import Finished, getpid, lock_file, monotonic_ns, seconds_since, u
 from .textutil import first_failed_test, format_seconds, numbers_after
 
 comptime STATS_MODE = "-1"
+# Building with this many mutants or more, test files without up-to-date
+# coverage are first built without mutants to measure it: then each binary
+# only gets the mutants its tests reach. DESPELL_COVERAGE_FIRST overrides it.
+comptime COVERAGE_FIRST = 1000
 
 
 # ---- phase 3: coverage ---------------------------------------------------------
@@ -29,36 +34,43 @@ def _test_argv(r: Run, file: String, names: List[String]) -> List[String]:
     return argv^
 
 
-def collect_stats(mut r: Run) raises:
-    """Run each test on its own, unmutated, recording which functions and
-    statements it reaches (and checking the suite is green)."""
+def collect_stats(mut r: Run, only_files: Set[String] = Set[String]()) raises:
+    """Run each test (of `only_files`, default all) on its own, unmutated,
+    recording which functions and statements it reaches (and checking the
+    suite is green)."""
     var env = with_env(r.mojo.env, ["DESPELL_MUTANT=" + String(STATS_MODE)])
     var commands = List[Command]()
-    for t in r.tests:
+    var indices = List[Int]()
+    for i in range(len(r.tests)):
+        ref t = r.tests[i]
+        if len(only_files) > 0 and not (t.file in only_files):
+            continue
+        indices.append(i)
         var names = List[String]()
         if t.name.byte_length():
             names.append(t.name)
         commands.append(Command(_test_argv(r, t.file, names), r.mdir, env.copy(), 0))
     var t0 = monotonic_ns()
     var results = run_parallel(commands, r.workers)
-    var failing = List[Int]()
+    var failing = List[Int]()  # into results
     var reached = False
-    for i in range(len(r.tests)):
-        ref t = r.tests[i]
+    for k in range(len(indices)):
+        ref t = r.tests[indices[k]]
         t.binary = String(r.binary_for(t.file)[byte = r.mdir.byte_length() + 1 :])
-        t.duration = results[i].seconds
-        t.functions = numbers_after(results[i].output, "despell-hit ")
-        t.sites = numbers_after(results[i].output, "despell-site ")
+        t.duration = results[k].seconds
+        t.functions = numbers_after(results[k].output, "despell-hit ")
+        t.sites = numbers_after(results[k].output, "despell-site ")
+        t.complete = True
         if len(t.functions) > 0:
             reached = True
-        if results[i].code != 0:
-            failing.append(i)
+        if results[k].code != 0:
+            failing.append(k)
     if len(failing) > 0:
         var msg = String(len(failing)) + " tests fail without any mutation applied:\n"
         for k in range(min(5, len(failing))):
-            msg += "\n--- " + r.tests[failing[k]].id + "\n" + String(results[failing[k]].output.strip()) + "\n"
+            msg += "\n--- " + r.tests[indices[failing[k]]].id + "\n" + String(results[failing[k]].output.strip()) + "\n"
         raise Error(msg)
-    log("ran " + String(len(r.tests)) + " tests on unmutated code (" + format_seconds(seconds_since(t0)) + "s)")
+    log("ran " + String(len(indices)) + " tests on unmutated code (" + format_seconds(seconds_since(t0)) + "s)")
     if len(r.mutants) > 0 and not reached:
         log("warning: no test reached any mutated function; check include_dirs")
 
@@ -156,7 +168,9 @@ def _tests_for(r: Run, m: MutantRecord, by_fid: Dict[Int, List[Int]], by_site: D
     var allowed = r.allowed.get(m.number, Set[String]())
     var tests = List[TestRecord]()
     for i in indices:
-        if not restricted or r.tests[i].file in allowed:
+        # coverage can vary between runs (timing): only binaries holding the
+        # mutant can test it
+        if (not restricted or r.tests[i].file in allowed) and r.holds(r.tests[i].file, m.number):
             tests.append(r.tests[i].copy())
     return tests^
 
@@ -333,6 +347,99 @@ def _save(mut r: Run, config: Config, before: State, current: Dict[String, Strin
 # ---- what to run ---------------------------------------------------------------
 
 
+def _coverage_current(
+    f: String, ids: List[String], old_tests: Dict[String, TestRecord], snapshots: Dict[String, Dict[String, String]],
+    current: Dict[String, String],
+) -> Bool:
+    """Whether the saved coverage of test file `f` (its tests `ids`) holds:
+    measured on every statement, with the same code and tests."""
+    if len(ids) == 0:
+        return False
+    try:
+        for id in ids:
+            if not old_tests[id].complete:
+                return False
+        var snap_id = old_tests[ids[0]].snapshot
+        if not (snap_id in snapshots):
+            return False
+        ref snap = snapshots[snap_id]
+        return (
+            snap.get("sources", "") == current.get("sources", "")
+            and snap.get("*", "") == current.get("*", "")
+            and snap.get(f, "") == current.get(f, "-")
+        )
+    except:
+        return False
+
+
+def _reached(r: Run, tests: List[TestRecord]) -> Set[Int]:
+    """The mutants (numbers) the tests reach."""
+    var sites = Set[Int]()
+    var fids = Set[Int]()
+    for t in tests:
+        for n in t.sites:
+            sites.add(n)
+        for n in t.functions:
+            fids.add(n)
+    var out = Set[Int]()
+    for m in r.mutants:
+        if (m.site in sites) if m.site >= 0 else (m.fid in fids):
+            out.add(m.number)
+    return out^
+
+
+def _coverage(
+    mut r: Run, old_tests: Dict[String, TestRecord], snapshots: Dict[String, Dict[String, String]],
+    current: Dict[String, String],
+) raises:
+    """Learn what each test file to build reaches: from the last run where
+    that still holds, else, for a big build, by building it without mutants
+    first. Then each binary only needs the mutants its tests reach."""
+    var by_file = Dict[String, List[String]]()
+    for item in old_tests.items():
+        var l = by_file.get(item.value.file, List[String]())
+        l.append(item.key)
+        by_file[item.value.file] = l^
+    var stale = List[String]()
+    for f in r.test_files():
+        var ids = by_file.get(f, List[String]())
+        if _coverage_current(f, ids, old_tests, snapshots, current):
+            var tests = List[TestRecord]()
+            for id in ids:
+                tests.append(old_tests[id].copy())
+            r.file_sets[f] = _reached(r, tests)
+        else:
+            stale.append(f)
+    var threshold = COVERAGE_FIRST
+    var override = getenv("DESPELL_COVERAGE_FIRST", "")
+    if override.byte_length():
+        threshold = Int(atol(override))
+    if len(stale) == 0 or len(r.enabled) < threshold:
+        return
+    var t0 = monotonic_ns()
+    try:
+        r.coverage_build(stale)
+    except e:
+        if String(e) == "interrupted":
+            raise e^
+        log("building without mutants to measure coverage failed, so every binary gets every mutant: " + String(e))
+        return
+    var stale_set = Set[String]()
+    for f in stale:
+        stale_set.add(f)
+    collect_stats(r, stale_set)
+    for f in stale:
+        var tests = List[TestRecord]()
+        for t in r.tests:
+            if t.file == f:
+                tests.append(t.copy())
+        r.file_sets[f] = _reached(r, tests)
+    log(
+        "measured coverage first, building " + String(len(stale)) + " test files without mutants ("
+        + format_seconds(seconds_since(t0)) + "s)"
+    )
+
+
 def _files_to_build(
     r: Run, selected: List[Int], plans: Dict[Int, Plan], old_tests: Dict[String, TestRecord],
     snapshots: Dict[String, Dict[String, String]], current: Dict[String, String],
@@ -367,14 +474,7 @@ def _files_to_build(
         if len(ids) == 0:
             needed.add(f)  # coverage unknown: it might reach them
             continue
-        var snap_id = old_tests.get(ids[0]).value().snapshot
-        var snap = snapshots.get(snap_id, Dict[String, String]())
-        if (
-            not (snap_id in snapshots)
-            or snap.get("sources", "") != current.get("sources", "")
-            or snap.get("*", "") != current.get("*", "")
-            or snap.get(f, "") != item.value
-        ):
+        if not _coverage_current(f, ids, old_tests, snapshots, current):
             needed.add(f)
             continue
         var reaches = False
@@ -497,7 +597,9 @@ def _run(config: Config, selectors: List[String], workers: Int, tree: String, fo
         only = s^
     else:
         r.tests = all_tests^
-    r.build(before.mutants, only)
+    r.begin_build(before.mutants, only)
+    _coverage(r, before.tests, before.snapshots, current)
+    r.finish_build(before.mutants)
     # a long build's verdicts survive whatever goes wrong after it
     _ = _save(r, config, before, current, snap, Set[String]())
     collect_stats(r)

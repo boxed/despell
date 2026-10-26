@@ -13,7 +13,7 @@ from std.collections import Dict, Set
 from std.os.path import isdir
 
 from .fsutil import (
-    copy_file, copy_tree, hash_text, is_dir, is_file, join, list_dir, mkdirs, parent, path_exists, read_text,
+    copy_file, copy_tree, hash_bytes, hash_text, read_bytes, is_dir, is_file, join, list_dir, mkdirs, parent, path_exists, read_text,
     real_path, relative_to, remove_file, rmtree, walk_files, write_text, Hasher,
 )
 from .jsonio import Json, encode, parse
@@ -24,7 +24,7 @@ from .state import (
     TIMEOUT, MutantRecord, Plan, State, StateLock, TestRecord, is_actionable, is_final, matches, merge_result,
     not_copied, plan, read_state, snapshot_id, test_file_hashes, write_state,
 )
-from .sysutil import Finished, ProcessPool, environment, getpid, lock_file, monotonic_ns, run_command, seconds_since, unlock_file, with_env
+from .sysutil import Finished, ProcessPool, environment, executable_path, getpid, lock_file, monotonic_ns, run_command, seconds_since, unlock_file, with_env
 from .textutil import (
     Diagnostic, absolutize_imports, first_error, first_failed_test, format_seconds, glob_match, join_words,
     link_references, numbers_after, parse_diagnostics, without_warnings,
@@ -262,15 +262,45 @@ def run_parallel(commands: List[Command], workers: Int) raises -> List[Finished]
 struct Failure(Copyable, Movable):
     var file: String
     var output: String
+    var group: Int  # index into Built.groups
+
+
+@fieldwise_init
+struct _Group(Copyable, Movable):
+    """Test files whose binaries hold the same mutants, and the copy of the
+    project they're built in."""
+
+    var root: String
+    var files: List[String]
+    var generated: List[GeneratedFile]
 
 
 struct Built(Movable):
-    var generated: List[GeneratedFile]
+    var groups: List[_Group]
     var failures: List[Failure]
 
-    def __init__(out self, var generated: List[GeneratedFile], var failures: List[Failure]):
-        self.generated = generated^
+    def __init__(out self, var groups: List[_Group], var failures: List[Failure]):
+        self.groups = groups^
         self.failures = failures^
+
+
+def _set_key(s: Set[Int]) -> String:
+    var ns = List[Int]()
+    for n in s:
+        ns.append(n)
+    sort(ns)
+    var h = Hasher()
+    for n in ns:
+        h.update(String(n))
+    return h.hex()
+
+
+def _sorted(s: Set[Int]) -> List[Int]:
+    var ns = List[Int]()
+    for n in s:
+        ns.append(n)
+    sort(ns)
+    return ns^
 
 
 @fieldwise_init
@@ -305,6 +335,14 @@ struct Run(Movable):
     # what each test file hashed to when this run started, and "*" for the
     # rest of the tests dir: what decides whether last run's binaries still do
     var test_hashes: Dict[String, String]
+    # what's being built: the mutants, and functions that can't hold mutants
+    var enabled: Set[Int]
+    var disabled_functions: Set[Int]
+    # per test file, the mutants its tests reach (absent: not known), which
+    # are all its binary needs
+    var file_sets: Dict[String, Set[Int]]
+    var build_t0: Int
+    var _generator: String  # a hash of despell itself
     var _pool: ProcessPool  # the test processes of the mutants running
 
     def __init__(out self, config: Config, workers: Int, tree: String):
@@ -322,6 +360,11 @@ struct Run(Movable):
         self.allowed = Dict[Int, Set[String]]()
         self.stats_done = False
         self.test_hashes = Dict[String, String]()
+        self.enabled = Set[Int]()
+        self.disabled_functions = Set[Int]()
+        self.file_sets = Dict[String, Set[Int]]()
+        self.build_t0 = 0
+        self._generator = String("")
         self._pool = ProcessPool()
 
     def mutant(mut self, n: Int) -> ref[self.mutants] MutantRecord:
@@ -428,21 +471,24 @@ struct Run(Movable):
     # ---- phase 2: build ------------------------------------------------------
 
     def generate_file(
-        self, sf: SourceFile, enabled: Set[Int], disabled_functions: Set[Int], dispatch_only: Set[Int] = Set[Int]()
+        self, sf: SourceFile, enabled: Set[Int], disabled_functions: Set[Int], dispatch_only: Set[Int] = Set[Int](),
+        hooks: Bool = False,
     ) raises -> GeneratedFile:
         return generate(
             sf.source, sf.functions, sf.first_fid, sf.first_mutant, self.n_functions, len(self.mutants) + 1,
-            Optional(enabled.copy()), disabled_functions, dispatch_only, True,
+            Optional(enabled.copy()), disabled_functions, dispatch_only, True, hooks,
         )
 
     def write_schemata(
-        self, enabled: Set[Int], disabled_functions: Set[Int], dispatch_only: Set[Int], root: String
+        self, enabled: Set[Int], disabled_functions: Set[Int], dispatch_only: Set[Int], root: String,
+        hooks: Bool = False,
     ) raises -> List[GeneratedFile]:
         """Write the schemata of every source file under `root`; returned in
-        the order of `self.files`."""
+        the order of `self.files`. With `hooks`, every statement records
+        coverage (see `generate`)."""
         var generated = List[GeneratedFile]()
         for sf in self.files:
-            var gen = self.generate_file(sf, enabled, disabled_functions, dispatch_only)
+            var gen = self.generate_file(sf, enabled, disabled_functions, dispatch_only, hooks)
             write_text(join(root, sf.rel), gen.text)
             generated.append(gen^)
         return generated^
@@ -462,9 +508,10 @@ struct Run(Movable):
         sort(files)
         return files^
 
-    def build_command(self, test_file: String, emit: String, root: String) -> Command:
+    def build_command(self, test_file: String, emit: String, root: String, output_to: String = "") -> Command:
         """`mojo build` of `test_file` in `root` (`self.mdir` for the real
-        binaries); with `emit` other than "exe", a check that writes no binary."""
+        binaries) to `output_to` (default: see `output_for`); with `emit`
+        other than "exe", a check that writes no binary."""
         var cmd = self.mojo.command.copy()
         cmd.append("build")
         # the schemata trigger lots of "unreachable code" warnings
@@ -472,7 +519,7 @@ struct Run(Movable):
         for inc in self.config.include_dirs:
             cmd.append("-I")
             cmd.append(inc)
-        var output = self.output_for(test_file, root)
+        var output = output_to if output_to.byte_length() else self.output_for(test_file, root)
         if emit != "exe":
             # report every elaboration error, not just the first 20
             cmd.append("--emit")
@@ -498,36 +545,96 @@ struct Run(Movable):
         if emit != "exe":
             remove_file(self.output_for(test_file, root) + ".ll")
 
+    def holds(self, test_file: String, n: Int) -> Bool:
+        """Whether the binary of `test_file` holds mutant `n`."""
+        if not (n in self.enabled):
+            return False
+        if test_file in self.file_sets:
+            try:
+                return n in self.file_sets[test_file]
+            except:
+                return False
+        return True
+
+    def set_for(self, test_file: String, enabled: Set[Int]) -> Set[Int]:
+        """The mutants of `enabled` the binary of `test_file` needs."""
+        if not (test_file in self.file_sets):
+            return enabled.copy()
+        var out = Set[Int]()
+        try:
+            ref reached = self.file_sets[test_file]
+            if len(reached) < len(enabled):
+                for n in reached:
+                    if n in enabled:
+                        out.add(n)
+            else:
+                for n in enabled:
+                    if n in reached:
+                        out.add(n)
+        except:
+            pass
+        return out^
+
     def build_all(
         mut self, enabled: Set[Int], disabled_functions: Set[Int], emit: String, test_files: List[String]
     ) raises -> Built:
+        """Build the test files (default: all), each with the mutants its
+        tests reach. Files that need the same mutants share a copy of the
+        project to build in: `self.mdir` for the first, the others under
+        work/trees."""
         self.n_builds += 1
-        var generated = self.write_schemata(enabled, disabled_functions, Set[Int](), self.mdir)
         var files = test_files.copy() if len(test_files) > 0 else self.test_files()
-        var commands = List[Command]()
+        var keys = List[String]()
+        var sets = List[Set[Int]]()
+        var groups = List[_Group]()
         for f in files:
-            commands.append(self.build_command(f, emit, self.mdir))
+            var s = self.set_for(f, enabled)
+            var key = _set_key(s)
+            var g = -1
+            for k in range(len(keys)):
+                if keys[k] == key:
+                    g = k
+            if g < 0:
+                g = len(keys)
+                keys.append(key)
+                sets.append(s^)
+                var root = self.mdir if g == 0 else join(join(self.work, "trees"), String(g))
+                groups.append(_Group(root, List[String](), List[GeneratedFile]()))
+            groups[g].files.append(f)
+        var commands = List[Command]()
+        for g in range(len(groups)):
+            var root = groups[g].root
+            if root != self.mdir and not is_dir(root):
+                var skip = not_copied()
+                for name in [WORK_DIR, STATE_FILE, STATE_LOCK, MAIN_LOCK, SIDE_DIR]:
+                    skip.append(String(name))
+                copy_tree(self.mdir, root, skip)
+            groups[g].generated = self.write_schemata(sets[g], disabled_functions, Set[Int](), root, True)
+            for f in groups[g].files:
+                var out = self.binary_for(f) if emit == "exe" else self.output_for(f, root)
+                commands.append(self.build_command(f, emit, root, out))
         var results = run_parallel(commands, self.workers)
         var failures = List[Failure]()
-        for i in range(len(files)):
-            self._drop_ir(emit, self.mdir, files[i])
-            if results[i].code != 0:
-                failures.append(Failure(files[i], results[i].output))
-        return Built(generated^, failures^)
+        var c = 0
+        for g in range(len(groups)):
+            for f in groups[g].files:
+                self._drop_ir(emit, groups[g].root, f)
+                if results[c].code != 0:
+                    failures.append(Failure(f, results[c].output, g))
+                c += 1
+        return Built(groups^, failures^)
 
     def find_mojo(mut self) raises:
         if not self.have_mojo:
             self.mojo = find_mojo(self.config)
             self.have_mojo = True
 
-    def build(mut self, previous: Dict[String, MutantRecord], only: Optional[Set[Int]]) raises:
-        """Build test binaries holding the `only` mutants (default: all of them).
-
-        Mutants that don't compile are found while checking with `--emit llvm`,
-        which stops before LLVM optimization and codegen (the bulk of a build)
-        but still runs elaboration, where many mutants fail.
-        """
+    def begin_build(mut self, previous: Dict[String, MutantRecord], only: Optional[Set[Int]]) raises:
+        """Settle what to build: the `only` mutants (default: all of them),
+        less what didn't compile last time and hasn't changed since."""
         self.find_mojo()
+        self.build_t0 = monotonic_ns()
+        self.n_builds = 0
         var enabled = Set[Int]()
         if only:
             enabled = only.value().copy()
@@ -535,7 +642,6 @@ struct Run(Movable):
             for m in self.mutants:
                 enabled.add(m.number)
         var disabled_functions = Set[Int]()
-        # skip what failed to compile last time and hasn't changed since
         for i in range(len(self.mutants)):
             ref m = self.mutants[i]
             var old = previous.get(m.id)
@@ -545,11 +651,38 @@ struct Run(Movable):
                 enabled.discard(m.number)
                 m.status = old.value().status
                 m.detail = old.value().detail
+        self.enabled = enabled^
+        self.disabled_functions = disabled_functions^
 
-        var t0 = monotonic_ns()
-        self.n_builds = 0
+    def coverage_build(mut self, files: List[String]) raises:
+        """Build `files` with coverage hooks and no mutants, to learn what
+        their tests reach before building them with mutants. Functions that
+        can't hold the hooks are found on the way."""
+        # binaries get overwritten from here on
+        remove_file(join(join(self.work, "bin"), MANIFEST))
+        var none = Set[Int]()
+        var disabled = self.disabled_functions.copy()
+        self.converge(none, disabled, "exe", False, files)
+        self.disabled_functions = disabled^
+
+    def finish_build(mut self, previous: Dict[String, MutantRecord]) raises:
+        """Build the test binaries, each with the mutants its tests reach
+        (all of them where that isn't known).
+
+        Mutants that don't compile are found while checking with `--emit llvm`,
+        which stops before LLVM optimization and codegen (the bulk of a build)
+        but still runs elaboration, where many mutants fail.
+        """
+        var enabled = Set[Int]()
+        var disabled_functions = self.disabled_functions.copy()
+        for n in self.enabled:
+            if self.mutants[n - 1].status != SKIPPED:
+                enabled.add(n)
+
+        var t0 = self.build_t0
         var manifest = join(join(self.work, "bin"), MANIFEST)
-        if self._reuse(enabled, manifest):
+        if self._reuse(enabled, disabled_functions, manifest):
+            self.enabled = enabled^
             log(
                 "reusing the last build's test binaries (" + String(len(self.test_files())) + " test files): they hold "
                 + "these mutants, and nothing they were built from has changed"
@@ -565,20 +698,36 @@ struct Run(Movable):
             var old = previous.get(m.id)
             if not (old and old.value().fingerprint == m.fingerprint and is_final(old.value().status)):
                 unknown.add(n)
+        var t_pre0 = monotonic_ns()
         self.precheck(unknown, disabled_functions)
         var still = Set[Int]()
         for n in enabled:
             if self.mutants[n - 1].status != COMPILE_ERROR:
                 still.add(n)
         enabled = still^
-        var t_pre = seconds_since(t0)
+        var t_pre = seconds_since(t_pre0)
+        # Mutants no test reaches are pre-checked (a compile error is worth
+        # knowing before writing a test for one) but not built
+        var everywhere = True
+        for f in self.test_files():
+            if not (f in self.file_sets):
+                everywhere = False
+        if everywhere:
+            var reached = Set[Int]()
+            for f in self.test_files():
+                for n in self.set_for(f, enabled):
+                    reached.add(n)
+            enabled = reached^
+        var t_check0 = monotonic_ns()
         self.converge(enabled, disabled_functions, "llvm", True)
-        var t1 = seconds_since(t0)
+        var t1 = seconds_since(t_check0) + t_pre
         var built = self.build_all(enabled, disabled_functions, "exe", List[String]())
         if len(built.failures) > 0:
             # rare: rejected only by the LLVM backend
             self.converge(enabled, disabled_functions, "exe", True)
-        self._write_manifest(enabled, disabled_functions, manifest)
+        self.enabled = enabled^
+        self.disabled_functions = disabled_functions^
+        self._write_manifest(manifest)
         var rejected = 0
         for m in self.mutants:
             if m.status == COMPILE_ERROR or m.status == SKIPPED:
@@ -589,69 +738,70 @@ struct Run(Movable):
             + "s, of which " + format_seconds(t_pre) + "s pre-checking modules; " + String(rejected) + " rejected)"
         )
 
-    def _build_inputs(self, enabled: Set[Int], disabled_functions: Set[Int], write: Bool) raises -> String:
-        """A hash of what the test binaries are built from, besides the test
-        files themselves, with `enabled` compiled in; with `write`, the
-        schemata are also written to the project copy."""
+    def _build_key(mut self, disabled_functions: List[Int]) raises -> String:
+        """A hash of what the binaries are built from, besides the test files
+        and the mutants in them: despell itself, the code, shared test code,
+        the build command."""
+        if self._generator.byte_length() == 0:
+            self._generator = hash_bytes(read_bytes(executable_path()))
         var h = Hasher()
-        for sf in self.files:
-            var gen = self.generate_file(sf, enabled, disabled_functions)
-            if write:
-                write_text(join(self.mdir, sf.rel), gen.text)
-            h.update(sf.rel)
-            h.update(gen.text)
+        h.update(self._generator)
+        h.update(self.test_hashes.get("sources", ""))
+        h.update(self.test_hashes.get("*", ""))
         for a in self.build_command(String("-"), String("exe"), self.mdir).argv:
             h.update(a)
-        h.update(self.test_hashes.get("*", ""))
+        for d in disabled_functions:
+            h.update(String(d))
         return h.hex()
 
-    def _write_manifest(self, enabled: Set[Int], disabled_functions: Set[Int], path: String) raises:
-        var ns = List[Int]()
-        for n in enabled:
-            ns.append(n)
-        sort(ns)
-        var ds = List[Int]()
-        for d in disabled_functions:
-            ds.append(d)
-        sort(ds)
-        var tests = Json.object()
+    def _write_manifest(mut self, path: String) raises:
+        var disabled = _sorted(self.disabled_functions)
+        var files = Json.object()
         for f in self.test_files():
-            tests.set(f, Json.of(self.test_hashes.get(f, "")))
+            var entry = Json.object()
+            entry.set("test", Json.of(self.test_hashes.get(f, "")))
+            entry.set("enabled", Json.ints(_sorted(self.set_for(f, self.enabled))))
+            files.set(f, entry^)
         var j = Json.object()
-        j.set("inputs", Json.of(self._build_inputs(enabled, disabled_functions, False)))
-        j.set("enabled", Json.ints(ns))
-        j.set("disabled_functions", Json.ints(ds))
-        j.set("tests", tests^)
+        j.set("key", Json.of(self._build_key(disabled)))
+        j.set("disabled_functions", Json.ints(disabled))
+        j.set("files", files^)
         write_text(path, encode(j))
 
-    def _reuse(self, enabled: Set[Int], path: String) -> Bool:
+    def _reuse(mut self, enabled: Set[Int], disabled_functions: Set[Int], path: String) -> Bool:
         """Whether the binaries of the last build can run the `enabled`
-        mutants: they hold every one of them, and neither the code, the test
-        files, the build command nor despell's schemata have changed. Writes
-        the schemata they were built from to the project copy."""
+        mutants: each holds what its tests need, and neither despell, the
+        code, the test files nor the build command have changed."""
         try:
             if not is_file(path):
                 return False
             var j = parse(read_text(path))
-            var built = Set[Int]()
-            for n in j.int_list("enabled"):
-                built.add(n)
-            for n in enabled:
-                if not (n in built):
-                    return False
-            var tests = j.get("tests")
+            if self._build_key(j.int_list("disabled_functions")) != j.str_or("key", ""):
+                return False
+            var files = j.get("files")
             for f in self.test_files():
-                if not tests.has(f) or tests.get(f).as_string() != self.test_hashes.get(f, "-"):
+                if not files.has(f) or not is_file(self.binary_for(f)):
                     return False
-                if not is_file(self.binary_for(f)):
+                var entry = files.get(f)
+                if entry.str_or("test", "") != self.test_hashes.get(f, "-"):
                     return False
-            var disabled = Set[Int]()
-            for d in j.int_list("disabled_functions"):
-                disabled.add(d)
-            # (a build follows if they don't match, and rewrites them)
-            return self._build_inputs(built, disabled, True) == j.str_or("inputs", "")
+                var held = Set[Int]()
+                for n in entry.int_list("enabled"):
+                    held.add(n)
+                for n in self.set_for(f, enabled):
+                    if not (n in held):
+                        return False
+            return True
         except:
             return False
+
+    def disable_function(mut self, fid: Int, detail: String, mut enabled: Set[Int], mut disabled_functions: Set[Int]):
+        disabled_functions.add(fid)
+        for i in range(len(self.mutants)):
+            if self.mutants[i].fid == fid:
+                enabled.discard(self.mutants[i].number)
+                self.mutants[i].status = SKIPPED
+                self.mutants[i].detail = detail
 
     def reject(mut self, n: Int, detail: String, mut enabled: Set[Int]):
         enabled.discard(n)
@@ -868,7 +1018,10 @@ struct Run(Movable):
 
     # ---- build attempts ------------------------------------------------------
 
-    def converge(mut self, mut enabled: Set[Int], mut disabled_functions: Set[Int], emit: String, recheck: Bool) raises:
+    def converge(
+        mut self, mut enabled: Set[Int], mut disabled_functions: Set[Int], emit: String, recheck: Bool,
+        files: List[String] = List[String](),
+    ) raises:
         """Remove mutants from `enabled` until the build passes.
 
         An error located in a mutant's own lines condemns that mutant. Vaguer
@@ -879,7 +1032,7 @@ struct Run(Movable):
         var suspects = List[Suspects]()
         # Taking mutants out never breaks a build that passed, so after the
         # first attempt only the test files that failed are built again.
-        var test_files = List[String]()
+        var test_files = files.copy()
         var attempt = 0
         while True:
             attempt += 1
@@ -896,13 +1049,14 @@ struct Run(Movable):
                 test_files.append(f.file)
                 var stem = f.file[byte = f.file.rfind("/") + 1 :]
                 write_text(join(logs, "attempt" + String(attempt) + "-" + emit + "-" + String(stem) + ".txt"), f.output)
-            var hits = self.attribute_errors(built.failures, built.generated, self.mdir)
+            var hits = self.attribute_errors(built)
             var dropped = 0
             for item in hits.mutants.items():
                 if item.key in enabled:
                     self.reject(item.key, item.value, enabled)
                     dropped += 1
             var set_aside = 0
+            var n_disabled = 0
             var why = String("")
             if dropped == 0:
                 var groups = List[Suspects]()
@@ -923,6 +1077,11 @@ struct Run(Movable):
                         for n in enabled:
                             if self.mutants[n - 1].fid == fid:
                                 group.append(n)
+                        if len(group) == 0:
+                            # nothing of it is in the build but coverage hooks
+                            self.disable_function(fid, "function can't hold despell's coverage hooks", enabled, disabled_functions)
+                            n_disabled += 1
+                            continue
                         groups.append(Suspects(group^, fid, test_files.copy()))
                     why = "errors pointing at " + String(len(hits.functions)) + " whole functions"
                 else:
@@ -938,7 +1097,7 @@ struct Run(Movable):
                     set_aside += len(g.group)
                     if len(g.group) > 0:
                         suspects.append(g.copy())
-                if set_aside == 0:
+                if set_aside == 0 and n_disabled == 0:
                     raise Error(
                         "building " + built.failures[0].file + " fails without any mutants:\n"
                         + without_warnings(built.failures[0].output)
@@ -946,6 +1105,7 @@ struct Run(Movable):
             log(
                 "build attempt " + String(attempt) + " (" + format_seconds(seconds_since(t0)) + "s): "
                 + String(dropped) + " mutants don't compile"
+                + (", " + String(n_disabled) + " functions can't hold coverage hooks" if n_disabled else String(""))
                 + (", set aside " + String(set_aside) + " suspects (" + why + ")" if set_aside else String(""))
             )
         if len(suspects) > 0 and recheck:
@@ -1027,12 +1187,7 @@ struct Run(Movable):
         var outs = self._slot_builds(items, dispatch, files, disabled_functions, emit)
         for k in range(len(fids)):
             if outs[k].byte_length():
-                disabled_functions.add(fids[k])
-                for i in range(len(self.mutants)):
-                    if self.mutants[i].fid == fids[k]:
-                        enabled.discard(self.mutants[i].number)
-                        self.mutants[i].status = SKIPPED
-                        self.mutants[i].detail = "function can't be mutated with schemata: " + first_error(outs[k])
+                self.disable_function(fids[k], "function can't be mutated with schemata: " + first_error(outs[k]), enabled, disabled_functions)
 
         var singles = List[Int]()
         items = List[Set[Int]]()
@@ -1062,7 +1217,7 @@ struct Run(Movable):
             + " builds (" + format_seconds(seconds_since(t0)) + "s): " + String(bad) + " don't compile"
         )
 
-    def attribute_errors(self, failures: List[Failure], generated: List[GeneratedFile], root: String) -> Hits:
+    def attribute_errors(self, built: Built) -> Hits:
         """Map compiler errors to mutants, statements and functions.
 
         An error is followed by notes. For "function instantiation failed" the
@@ -1075,14 +1230,16 @@ struct Run(Movable):
         a missing symbol.
         """
         var hits = Hits()
-        var file_index = Dict[String, Int]()
-        for i in range(len(self.files)):
-            file_index[join(root, self.files[i].rel)] = i
         var fids = Dict[String, Int]()
         for m in self.mutants:
             fids[String(m.id[byte = 0 : m.id.rfind(".")])] = m.fid
         var seen_sites = Set[String]()
-        for f in failures:
+        for f in built.failures:
+            ref group = built.groups[f.group]
+            var root = group.root
+            var file_index = Dict[String, Int]()
+            for i in range(len(self.files)):
+                file_index[join(root, self.files[i].rel)] = i
             var chains = List[List[Diagnostic]]()
             for d in parse_diagnostics(f.output):
                 if d.is_error:
@@ -1105,7 +1262,7 @@ struct Run(Movable):
                     var path = d.path if d.path.startswith("/") else join(root, d.path)
                     if not (path in file_index):
                         continue
-                    ref regions = generated[file_index.get(path, 0)].regions
+                    ref regions = group.generated[file_index.get(path, 0)].regions
                     var best = -1
                     for r in range(len(regions)):
                         if regions[r].start <= d.line and d.line <= regions[r].end:

@@ -142,11 +142,22 @@ what produced it:
 Rejected mutants and skipped functions are remembered between runs, and
 `despell run <ids>` only builds the selected mutants, so re-checks are quick.
 
-**Coverage.** A first pass runs each test on its own with `DESPELL_MUTANT=-1`.
-That runs the original code and records which functions each test reaches.
-It also checks the suite is green before mutating anything.
+**Coverage.** Every statement holding mutations starts with a hook, whether
+its mutants are in the build or not. Running each test on its own with
+`DESPELL_MUTANT=-1` runs the original code and records which statements each
+test reaches. It also checks the suite is green before mutating anything.
 
-**Running mutants.** Each mutant runs only the tests that reach its function,
+**One binary per test file, holding only what its tests reach.** Compile time
+grows with the schemata, and every test binary compiles everything its test
+file imports. A test file's tests usually execute only a fraction of the code
+the compiler can reach from it, so each binary only gets the mutants its tests
+reach. For a big build without up-to-date coverage, the test files are built
+without mutants first to measure it. Mutants no test reaches are still
+pre-checked, so they come out `compile_error` or `no_tests`, but never built.
+Test files that need the same mutants share a copy of the project to build
+in; the others get their own.
+
+**Running mutants.** Each mutant runs only the tests that reach its statement,
 grouped per test binary, in parallel worker processes, with a timeout derived
 from the measured test durations.
 

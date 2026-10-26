@@ -150,6 +150,9 @@ struct TestRecord(Copyable, Movable):
     var sites: List[Int]
     # the snapshot of the sources and tests this coverage was measured with
     var snapshot: String
+    # measured with coverage hooks on every statement; else (older despell
+    # versions) only the statements of the mutants in that build
+    var complete: Bool
 
     def __init__(out self, id: String, file: String, name: String):
         self.id = id
@@ -160,6 +163,7 @@ struct TestRecord(Copyable, Movable):
         self.functions = List[Int]()
         self.sites = List[Int]()
         self.snapshot = String("")
+        self.complete = False
 
     def to_json(self) -> Json:
         var j = Json.object()
@@ -171,6 +175,7 @@ struct TestRecord(Copyable, Movable):
         j.set("functions", Json.ints(self.functions))
         j.set("sites", Json.ints(self.sites))
         j.set("snapshot", _opt(self.snapshot))
+        j.set("complete", Json.of(self.complete))
         return j^
 
     @staticmethod
@@ -181,6 +186,7 @@ struct TestRecord(Copyable, Movable):
         t.functions = j.int_list("functions")
         t.sites = j.int_list("sites")
         t.snapshot = j.str_or("snapshot", "")
+        t.complete = j.has("complete") and j.get("complete").as_bool()
         return t^
 
     def covers(self, m: MutantRecord) -> Bool:

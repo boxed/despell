@@ -38,6 +38,24 @@ def string_from_bytes(bytes: List[UInt8]) -> String:
     return String(from_utf8_lossy=Span(bytes))
 
 
+def executable_path() raises -> String:
+    """The path of the running program."""
+    var buf = alloc_zero(4096)
+    comptime if CompilationTarget.is_macos():
+        var size = UInt32(4096)
+        if external_call["_NSGetExecutablePath", Int32](buf.unsafe_ptr(), Pointer(to=size)) != 0:
+            raise Error("can't find despell's executable")
+    else:
+        var link = c_string("/proc/self/exe")
+        var n = external_call["readlink", Int](link.unsafe_ptr(), buf.unsafe_ptr(), 4095)
+        if n <= 0:
+            raise Error("can't find despell's executable")
+    var n = 0
+    while n < len(buf) and buf[n] != 0:
+        n += 1
+    return String(StringSpan(unsafe_from_utf8=Span(buf)[0:n]))
+
+
 # ---- environment -------------------------------------------------------------
 
 

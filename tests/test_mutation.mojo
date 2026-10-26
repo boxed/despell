@@ -124,6 +124,30 @@ def test_generate_respects_enabled_and_disabled() raises:
     assert_false("despell_m_" in generate(src, fs, 0, 1, 1, disabled_functions=off).text)
 
 
+def _site_hooks(text: String) -> List[String]:
+    var hooks = List[String]()
+    for line in text.splitlines():
+        if "_despell_site(" in line:
+            hooks.append(String(line.strip()))
+    return hooks^
+
+
+def test_hooks_everywhere_records_coverage_without_mutants() raises:
+    var src = String(
+        "def f(k: Int) -> Int:\n    var total = k + 1\n    if k > 2:\n        total += 1\n        return total\n"
+        + "    return k * 3\n"
+    )
+    var fs = analyze(src)
+    var full = generate(src, fs, 0, 1, 1).text
+    var none = generate(src, fs, 0, 1, 1, enabled=Set[Int](), hooks_everywhere=True).text
+    # the same statements record coverage, but no mutant is in there
+    assert_equal(_site_hooks(none), _site_hooks(full))
+    assert_true(len(_site_hooks(none)) >= 3)
+    assert_false("despell_m_ == 1" in none or "@inline" in none)
+    # without it, functions without active mutants are left alone
+    assert_false("despell_m_" in generate(src, fs, 0, 1, 1, enabled=Set[Int]()).text)
+
+
 def test_no_inline_on_mutated_functions() raises:
     var src = String(
         "@always_inline\ndef a(x: Int) -> Int:\n    return x + 1\n\n"

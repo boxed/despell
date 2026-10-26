@@ -894,11 +894,17 @@ struct _Emitter:
                 var ind = _indented(depth) + site.indent
                 self.out.append(ind + "if " + self.mvar(site) + " == -1:\n")
                 self.out.append(ind + INDENT + "_despell_site(" + String(self.sites[k].key) + ")\n")
-            if site.kind == DUP:
-                var others = List[Int]()
-                for o in indices:
-                    if o != k:
-                        others.append(o)
+            var others = List[Int]()
+            for o in indices:
+                if o != k:
+                    others.append(o)
+            if len(self.sites[k].active) == 0:
+                # only here for its coverage hook
+                if site.kind == DUP:
+                    self.emit_range(site.first_line, site.last_line, depth, others)
+                else:
+                    self.copy_own(site.first_line, site.last_line, depth)
+            elif site.kind == DUP:
                 self.emit_dup(k, depth, others)
             elif site.kind == DECL:
                 self.emit_decl(k, depth)
@@ -1004,6 +1010,7 @@ def generate(
     disabled_functions: Set[Int] = Set[Int](),
     dispatch_only: Set[Int] = Set[Int](),
     no_inline: Bool = False,
+    hooks_everywhere: Bool = False,
 ) raises -> GeneratedFile:
     """Emit the schemata version of a file.
 
@@ -1011,7 +1018,9 @@ def generate(
     `first_fid` regardless of `enabled` (None: all), so numbering is stable
     while mutants are dropped for not compiling. Functions in `dispatch_only`
     get their dispatch even without active mutants, to check that it
-    compiles.
+    compiles. With `hooks_everywhere`, every statement that holds mutants
+    records coverage, active or not, so coverage doesn't depend on which
+    mutants a build holds.
     """
     var src = tokenize(source)
     var lines = src.lines.copy()
@@ -1044,13 +1053,16 @@ def generate(
                 if not enabled or number in enabled.value():
                     active.append(gm^)
                 number += 1
-            if len(active) > 0:
+            if len(active) > 0 or hooks_everywhere:
                 em.sites.append(_ActiveSite(site.copy(), active^, key))
         gen_functions.append(GeneratedFunction(fid, f.qualname, f.def_line, gen_mutants^))
 
         for i in range(pos, f.def_line):
             em.out.append(lines[i])
-        var has_active = len(em.sites) > 0
+        var has_active = False
+        for a in em.sites:
+            if len(a.active) > 0:
+                has_active = True
         if no_inline and has_active and not (fid in disabled_functions):
             # Inlining functions that hold all their mutants into each other
             # multiplies code size along call chains, which can make LLVM take
@@ -1068,7 +1080,7 @@ def generate(
         for i in range(f.def_line, f.body_start):
             em.out.append(lines[i])
         pos = f.body_end + 1
-        if fid in disabled_functions or not has_active:
+        if fid in disabled_functions or len(em.sites) == 0:
             if fid in dispatch_only and not (fid in disabled_functions):
                 em.out.append(f.body_indent + "_ = _despell_active(" + String(fid) + ")\n")
                 em.regions.append(Region(def_line_out, len(em.out) - 1, fid))
@@ -1083,7 +1095,7 @@ def generate(
         for k in range(len(em.sites)):
             all_sites.append(k)
         em.emit_range(f.body_start, f.body_end, 0, all_sites)
-        if f.has_result:
+        if f.has_result and has_active:
             # A mutant can make the end of the body reachable (`while True`
             # -> `while False`), which Mojo would reject for the whole function.
             em.out.append(f.body_indent + '_despell_abort("despell: a mutant fell off the end of ' + f.qualname + '")\n')
