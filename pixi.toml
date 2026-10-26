@@ -6,6 +6,8 @@ platforms = ["osx-arm64"]
 version = "0.1.0"
 
 [tasks]
+build = "mkdir -p build && mojo build -I src src/main.mojo -o build/despell"
+test = { cmd = "bash scripts/test.sh", depends-on = ["build"] }
 
 [dependencies]
 mojo = ">=1.2.0,<2"

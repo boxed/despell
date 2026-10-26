@@ -1,6 +1,4 @@
 .pixi/
-.venv/
-__pycache__/
 tmp/
 mutants/
-*.egg-info/
+build/

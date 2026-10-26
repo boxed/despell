@@ -158,9 +158,21 @@ anyway: the runtime has already started libdispatch threads, and a forked child
 crashes on exit on macOS. Compile time dominates the run, and schemata already
 solve that.
 
+## Installing
+
+despell is written in Mojo. Build it with [pixi](https://pixi.sh) and put the
+binary on your `PATH`:
+
+```
+pixi run build        # writes build/despell
+```
+
 ## Developing
 
 ```
-pixi install          # Mojo, for the end-to-end tests
-uv run pytest
+pixi run test         # builds, then runs every tests/test_*.mojo
 ```
+
+`tests/test_e2e.mojo` runs the built binary on a copy of
+`e2e_projects/simple` and compares every mutant's status with
+`tests/e2e_expected.txt`.
