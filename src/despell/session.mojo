@@ -388,9 +388,10 @@ def _files_to_build(
     return needed^
 
 
-def run(config: Config, selectors: List[String], workers: Int) raises -> List[MutantRecord]:
+def run(config: Config, selectors: List[String], workers: Int, force: Bool = False) raises -> List[MutantRecord]:
     """Run the selected mutants, or, without selectors, every mutant without
-    an up-to-date result. Returns the selected mutants, or all of them."""
+    an up-to-date result (with `force`, whatever their results). Returns the
+    selected mutants, or all of them."""
     # mutants/ itself, or a private copy beside it if another run has it
     mkdirs(config.mutants_dir())
     var main_lock = lock_file(join(config.mutants_dir(), MAIN_LOCK), False)
@@ -399,7 +400,7 @@ def run(config: Config, selectors: List[String], workers: Int) raises -> List[Mu
         tree = join(join(config.mutants_dir(), SIDE_DIR), String(getpid()))
         log("another despell run is using mutants/; this one works in mutants/" + String(SIDE_DIR) + "/" + String(getpid()))
     try:
-        var result = _run(config, selectors, workers, tree)
+        var result = _run(config, selectors, workers, tree, force)
         _release(main_lock, tree, config)
         return result^
     except e:
@@ -414,7 +415,7 @@ def _release(lock: Int, tree: String, config: Config):
         rmtree(tree)
 
 
-def _run(config: Config, selectors: List[String], workers: Int, tree: String) raises -> List[MutantRecord]:
+def _run(config: Config, selectors: List[String], workers: Int, tree: String, force: Bool) raises -> List[MutantRecord]:
     var t0 = monotonic_ns()
     var lock = StateLock(config)
     var before = read_state(config)
@@ -433,6 +434,7 @@ def _run(config: Config, selectors: List[String], workers: Int, tree: String) ra
         sources += sf.source + "\0"
     current["sources"] = hash_text(sources)
     var snap = snapshot_id(current)
+    r.test_hashes = current.copy()
     log(
         "generated " + String(len(r.mutants)) + " mutants in " + String(r.n_functions) + " functions across "
         + String(len(r.files)) + " files; " + String(len(all_tests)) + " tests"
@@ -454,6 +456,8 @@ def _run(config: Config, selectors: List[String], workers: Int, tree: String) ra
     for m in r.mutants:
         if len(selectors) == 0 or matches(m, selectors):
             chosen.append(m.number)
+            if force:
+                plans[m.number] = Plan(True, True, Set[String]())
     if len(selectors) > 0 and len(chosen) == 0:
         raise Error("no mutants match " + _joined(selectors))
     var selected = List[Int]()
@@ -466,7 +470,7 @@ def _run(config: Config, selectors: List[String], workers: Int, tree: String) ra
             + "can affect; running the other " + String(len(selected))
         )
     if len(selected) == 0:
-        log("nothing to run: every result is up to date. Pass mutant ids to `despell run` to run them anyway")
+        log("nothing to run: every result is up to date. `despell run --force <selector>` runs them anyway")
         var state = _save(r, config, before, current, snap, Set[String]())
         return _records(state, r, chosen)
     for n in selected:

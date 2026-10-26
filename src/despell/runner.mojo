@@ -16,6 +16,7 @@ from .fsutil import (
     copy_file, copy_tree, hash_text, is_dir, is_file, join, list_dir, mkdirs, parent, path_exists, read_text,
     real_path, relative_to, remove_file, rmtree, walk_files, write_text, Hasher,
 )
+from .jsonio import Json, encode, parse
 from .mutation import Function, GeneratedFile, Region, analyze, generate
 from .project import Config, MojoEnv, find_mojo
 from .state import (
@@ -32,6 +33,7 @@ from .tokenizer import tokenize
 
 comptime WORK_DIR = ".despell"
 comptime STATS_MODE = "-1"
+comptime MANIFEST = "manifest.json"
 
 
 def log(msg: String):
@@ -300,6 +302,9 @@ struct Run(Movable):
     # test files each mutant is run against (absent: all that reach it)
     var allowed: Dict[Int, Set[String]]
     var stats_done: Bool
+    # what each test file hashed to when this run started, and "*" for the
+    # rest of the tests dir: what decides whether last run's binaries still do
+    var test_hashes: Dict[String, String]
     var _pool: ProcessPool  # the test processes of the mutants running
 
     def __init__(out self, config: Config, workers: Int, tree: String):
@@ -316,6 +321,7 @@ struct Run(Movable):
         self.n_builds = 0
         self.allowed = Dict[Int, Set[String]]()
         self.stats_done = False
+        self.test_hashes = Dict[String, String]()
         self._pool = ProcessPool()
 
     def mutant(mut self, n: Int) -> ref[self.mutants] MutantRecord:
@@ -347,7 +353,10 @@ struct Run(Movable):
             remove_file(join(self.mdir, ".gitignore"))
         else:
             write_text(join(self.mdir, ".gitignore"), "*\n")
-        rmtree(self.work)
+        # the binaries stay: the next run may be able to use them
+        for name in list_dir(self.work):
+            if name != "bin":
+                rmtree(join(self.work, name))
         mkdirs(join(self.work, "bin"))
 
         var root_real = real_path(cfg.root)
@@ -539,6 +548,15 @@ struct Run(Movable):
 
         var t0 = monotonic_ns()
         self.n_builds = 0
+        var manifest = join(join(self.work, "bin"), MANIFEST)
+        if self._reuse(enabled, manifest):
+            log(
+                "reusing the last build's test binaries (" + String(len(self.test_files())) + " test files): they hold "
+                + "these mutants, and nothing they were built from has changed"
+            )
+            return
+        # binaries get overwritten from here on
+        remove_file(manifest)
         # the pre-check can only reject mutants: the ones that compiled in an
         # earlier build, unchanged since, don't need it
         var unknown = Set[Int]()
@@ -560,6 +578,7 @@ struct Run(Movable):
         if len(built.failures) > 0:
             # rare: rejected only by the LLVM backend
             self.converge(enabled, disabled_functions, "exe", True)
+        self._write_manifest(enabled, disabled_functions, manifest)
         var rejected = 0
         for m in self.mutants:
             if m.status == COMPILE_ERROR or m.status == SKIPPED:
@@ -569,6 +588,70 @@ struct Run(Movable):
             + "s (" + String(self.n_builds) + " builds; checking mutants took " + format_seconds(t1)
             + "s, of which " + format_seconds(t_pre) + "s pre-checking modules; " + String(rejected) + " rejected)"
         )
+
+    def _build_inputs(self, enabled: Set[Int], disabled_functions: Set[Int], write: Bool) raises -> String:
+        """A hash of what the test binaries are built from, besides the test
+        files themselves, with `enabled` compiled in; with `write`, the
+        schemata are also written to the project copy."""
+        var h = Hasher()
+        for sf in self.files:
+            var gen = self.generate_file(sf, enabled, disabled_functions)
+            if write:
+                write_text(join(self.mdir, sf.rel), gen.text)
+            h.update(sf.rel)
+            h.update(gen.text)
+        for a in self.build_command(String("-"), String("exe"), self.mdir).argv:
+            h.update(a)
+        h.update(self.test_hashes.get("*", ""))
+        return h.hex()
+
+    def _write_manifest(self, enabled: Set[Int], disabled_functions: Set[Int], path: String) raises:
+        var ns = List[Int]()
+        for n in enabled:
+            ns.append(n)
+        sort(ns)
+        var ds = List[Int]()
+        for d in disabled_functions:
+            ds.append(d)
+        sort(ds)
+        var tests = Json.object()
+        for f in self.test_files():
+            tests.set(f, Json.of(self.test_hashes.get(f, "")))
+        var j = Json.object()
+        j.set("inputs", Json.of(self._build_inputs(enabled, disabled_functions, False)))
+        j.set("enabled", Json.ints(ns))
+        j.set("disabled_functions", Json.ints(ds))
+        j.set("tests", tests^)
+        write_text(path, encode(j))
+
+    def _reuse(self, enabled: Set[Int], path: String) -> Bool:
+        """Whether the binaries of the last build can run the `enabled`
+        mutants: they hold every one of them, and neither the code, the test
+        files, the build command nor despell's schemata have changed. Writes
+        the schemata they were built from to the project copy."""
+        try:
+            if not is_file(path):
+                return False
+            var j = parse(read_text(path))
+            var built = Set[Int]()
+            for n in j.int_list("enabled"):
+                built.add(n)
+            for n in enabled:
+                if not (n in built):
+                    return False
+            var tests = j.get("tests")
+            for f in self.test_files():
+                if not tests.has(f) or tests.get(f).as_string() != self.test_hashes.get(f, "-"):
+                    return False
+                if not is_file(self.binary_for(f)):
+                    return False
+            var disabled = Set[Int]()
+            for d in j.int_list("disabled_functions"):
+                disabled.add(d)
+            # (a build follows if they don't match, and rewrites them)
+            return self._build_inputs(built, disabled, True) == j.str_or("inputs", "")
+        except:
+            return False
 
     def reject(mut self, n: Int, detail: String, mut enabled: Set[Int]):
         enabled.discard(n)

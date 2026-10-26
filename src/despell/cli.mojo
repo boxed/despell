@@ -51,7 +51,9 @@ interrupted run continues where it stopped, changed code is re-checked,
 killed mutants stay killed while the test file that killed them is
 unchanged, and survivors are re-run against new or changed test files only.
 A change to shared test code (anything under tests_dir that isn't a test
-file) re-runs everything. Delete mutants/ to start over.
+file) re-runs everything. `despell run --force <selector>` re-runs the
+selected mutants against every test that reaches them, whatever their
+results (a flaky test, say). Delete mutants/ to start over.
 
 Selectors for `run`, `results` and `show`: a mutant id (mylib.math.clamp.2),
 a function or module prefix (mylib.math.clamp, mylib.math), a glob
@@ -84,7 +86,7 @@ comptime USAGE = """usage: despell <command> [options]
 Mutation testing for Mojo. Run `despell guide` for the workflow.
 
 commands:
-  run [selector ...] [-j N]                 generate mutants and test them
+  run [selector ...] [-j N] [--force]       generate mutants and test them
   results [selector ...] [--all] [--status s,s] [--json]
                                             list mutants from the last run (default: the ones to act on)
   show <selector> ... [--json]              show diff, location and covering tests for mutants
@@ -174,8 +176,13 @@ def _default_workers() -> Int:
 def cmd_run(args: List[String]) raises -> Int:
     var selectors = List[String]()
     var workers = 0
+    var force = False
     var i = 0
     while i < len(args):
+        if args[i] == "--force":
+            force = True
+            i += 1
+            continue
         if args[i] == "-j" or args[i] == "--jobs":
             if i + 1 >= len(args):
                 raise Error("-j needs a number")
@@ -191,7 +198,7 @@ def cmd_run(args: List[String]) raises -> Int:
         selectors.append(args[i])
         i += 1
     var config = load_config(_root())
-    var mutants = run(config, selectors, workers if workers > 0 else _default_workers())
+    var mutants = run(config, selectors, workers if workers > 0 else _default_workers(), force)
     print()
     _report(mutants)
     return 0

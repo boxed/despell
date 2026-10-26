@@ -26,7 +26,7 @@ Next: `despell show <id>` to see a mutant's diff and the tests that reach it.
 ## Usage
 
 ```
-despell run [selector ...]       generate mutants, build, test (all, or just the selected ones)
+despell run [selector ...]       generate mutants, build, test (all, or just the selected ones; --force)
 despell results [selector ...]   list survivors and untested mutants (--all, --status, --json)
 despell show <selector> ...      diff, location, status and the tests that reach the code (--json)
 despell guide                    workflow, statuses and config, written for agents
@@ -76,7 +76,8 @@ remembers the test files it was obtained with, so a plain `despell run` only
 runs what could have changed: mutants without a result (an interrupted run
 continues where it stopped), changed code, killed mutants whose killing test
 file changed, and survivors against new or changed test files. A change to
-shared test code re-runs everything. Delete `mutants/` to start over.
+shared test code re-runs everything. `despell run --force <selector>` re-runs
+the selected mutants whatever their results. Delete `mutants/` to start over.
 
 despell copies the project into `mutants/` (minus version control,
 environments and caches) and runs the tests there. It puts a `.gitignore`

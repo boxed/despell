@@ -83,9 +83,14 @@ def test_4_run_continues_where_it_stopped() raises:
             mutants.items[i].set("status", Json.of(String("not_checked")))
     data.set("mutants", mutants^)
     write_text(path, encode(data))
-    assert_true("running the other 2" in despell("run", "-j", "4"))
+    var out = despell("run", "-j", "4")
+    assert_true("running the other 2" in out, out)
+    # nothing changed since the binaries were built, and they hold both
+    assert_true("reusing the last build's test binaries" in out, out)
     assert_expected()
     assert_true("nothing to run" in despell("run", "-j", "4"))
+    var forced = despell("run", "-j", "4", "--force", "mylib.mathx.add.1")
+    assert_true("running 1 mutants" in forced and "1 mutants: 1 killed" in forced, forced)
 
 
 def test_5_rerun_single_mutant_after_adding_a_test() raises:
@@ -103,6 +108,7 @@ def test_5_rerun_single_mutant_after_adding_a_test() raises:
     assert_true("2 mutants: 2 killed" in out, out)
     # test_tricky doesn't reach Counter.tick and didn't change
     assert_true("building the 1 of 2 test files" in out, out)
+    assert_false("reusing" in out, out)
     var s = statuses()
     # untouched mutants keep their earlier results
     assert_equal(s["mylib.mathx.untested.1"], String("no_tests"))
