@@ -142,12 +142,40 @@ def children_cpu_seconds() -> Float64:
     return user + system
 
 
-def load_average() -> Float64:
-    """The 1-minute load average (0 if unknown)."""
-    var buf = alloc_zero(8)
-    if external_call["getloadavg", Int32](buf.unsafe_ptr(), Int32(1)) != 1:
-        return 0
-    return buf.unsafe_ptr().unsafe_bitcast[Float64]()[unsafe_offset=0]
+@fieldwise_init
+struct CpuTicks(Copyable, Movable):
+    """The machine's CPU time so far, in ticks: idle, and in all."""
+
+    var idle: Int
+    var total: Int
+
+
+def cpu_ticks() -> CpuTicks:
+    """CPU time of the whole machine (zeros if unknown). The load average is
+    no use for this: it counts runnable threads, many per test process."""
+    comptime if CompilationTarget.is_macos():
+        var info = alloc_zero(16)  # host_cpu_load_info: user, system, idle, nice
+        var count = alloc_zero(4)
+        count.unsafe_ptr().unsafe_bitcast[Int32]()[unsafe_offset=0] = 4
+        var host = external_call["mach_host_self", UInt32]()
+        if external_call["host_statistics", Int32](host, Int32(3), info.unsafe_ptr(), count.unsafe_ptr()) != 0:
+            return CpuTicks(0, 0)
+        var p = info.unsafe_ptr().unsafe_bitcast[UInt32]()
+        var total = 0
+        for i in range(4):
+            total += Int(p[unsafe_offset=i])
+        return CpuTicks(Int(p[unsafe_offset=2]), total)
+    else:
+        try:
+            with open("/proc/stat", "r") as f:
+                # cpu  user nice system idle iowait irq softirq steal ...
+                var parts = f.read().splitlines()[0].split()
+                var total = 0
+                for i in range(1, len(parts)):
+                    total += Int(atol(parts[i]))
+                return CpuTicks(Int(atol(parts[4])), total)
+        except:
+            return CpuTicks(0, 0)
 
 
 def memory_available() -> Float64:

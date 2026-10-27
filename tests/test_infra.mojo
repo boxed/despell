@@ -2,7 +2,7 @@ from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
 from despell.fsutil import hash_text, join, parent, relative_to, basename
 from despell.jsonio import Json, encode, parse
-from despell.sysutil import ProcessPool, environment, memory_available
+from despell.sysutil import ProcessPool, cpu_ticks, environment, memory_available
 from despell.toml import read_table
 
 
@@ -75,6 +75,16 @@ def test_peak_memory_of_a_child() raises:
     assert_true(f.memory > 50_000_000, String(f.memory))
     var available = memory_available()
     assert_true(available > 0 and available <= 1, String(available))
+
+
+def test_cpu_ticks_count_up() raises:
+    var a = cpu_ticks()
+    var spin = 0
+    for i in range(50_000_000):
+        spin += i % 7
+    var b = cpu_ticks()
+    assert_true(a.total > 0 and a.idle <= a.total, String(a.idle) + " " + String(a.total))
+    assert_true(b.total > a.total and b.idle >= a.idle, String(spin))
 
 
 def test_hash_is_stable() raises:

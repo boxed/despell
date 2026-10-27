@@ -12,7 +12,7 @@ from .state import (
     write_state,
 )
 from .sysutil import (
-    Finished, children_cpu_seconds, getpid, load_average, lock_file, memory_available, monotonic_ns, seconds_since,
+    CpuTicks, Finished, children_cpu_seconds, cpu_ticks, getpid, lock_file, memory_available, monotonic_ns, seconds_since,
     unlock_file, with_env,
 )
 from .textutil import first_failed_test, format_seconds, numbers_after
@@ -267,6 +267,7 @@ struct _Scaler(Movable):
     var t_ns: Int
     var cpu: Float64
     var busy: Float64  # cores the tests keep busy, smoothed
+    var ticks: CpuTicks
 
     def __init__(out self, on: Bool, workers: Int):
         from std.sys.info import num_physical_cores
@@ -278,6 +279,7 @@ struct _Scaler(Movable):
         self.t_ns = monotonic_ns()
         self.cpu = children_cpu_seconds()
         self.busy = -1
+        self.ticks = cpu_ticks()
 
     def adjust(mut self, workers: Int) -> Int:
         """How many workers to have now (looked at every few seconds)."""
@@ -295,11 +297,16 @@ struct _Scaler(Movable):
         self.busy = busy if self.busy < 0 else (self.busy + busy) / 2
         self.t_ns = now
         self.cpu = cpu
+        # the machine's idle share, which other work counts against too
+        var ticks = cpu_ticks()
+        var idle = 1.0
+        if ticks.total > self.ticks.total:
+            idle = Float64(ticks.idle - self.ticks.idle) / Float64(ticks.total - self.ticks.total)
+        self.ticks = ticks^
         var target = 0.8 * Float64(self.cores)
-        var load = load_average()
-        if self.busy > target or load > 1.5 * Float64(self.cores):
+        if self.busy > target or idle < 0.1:
             return max(self.low, workers - max(1, workers // 8))
-        if self.busy < 0.6 * target and load < Float64(self.cores) and memory > 2 * LOW_MEMORY:
+        if self.busy < 0.6 * target and idle > 0.3 and memory > 2 * LOW_MEMORY:
             return min(self.high, workers + max(1, workers // 4))
         return workers
 
