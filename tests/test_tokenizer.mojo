@@ -27,6 +27,25 @@ def test_strings_with_prefixes_and_escapes() raises:
     assert_equal(kinds('r"a\\"b" + t"{x}" + rb\'z\'\n'), String('2:r"a\\"b" 3:+ 2:t"{x}" 3:+ 2:rb\'z\''))
 
 
+def test_a_backslash_newline_continues_a_string() raises:
+    var src = tokenize('var a = "hello \\\nworld"\nvar b = 1\n')
+    assert_equal(src.tokens[3].text, String('"hello \\\nworld"'))
+    assert_equal(src.tokens[3].end_line, 1)
+    assert_equal(len(src.logical_lines), 2)
+
+
+def test_t_string_interpolations_hold_strings() raises:
+    # as Mojo's lexer reads them (tools/lexer_oracle)
+    assert_equal(kinds('t"hello {"world"}" + 1\n'), String('2:t"hello {"world"}" 3:+ 1:1'))
+    assert_equal(kinds('t\'say {"\\"hi\\""}\'\n'), String('2:t\'say {"\\"hi\\""}\''))
+    assert_equal(kinds('t"A {t"B {t"C {v}"}"}" + 1\n'), String('2:t"A {t"B {t"C {v}"}"}" 3:+ 1:1'))
+    assert_equal(kinds('t"{{x}} {f(rt"{y}")}"\n'), String('2:t"{{x}} {f(rt"{y}")}"'))
+
+
+def test_less_greater_is_one_token() raises:
+    assert_equal(kinds("a <> b\n"), String("0:a 3:<> 0:b"))
+
+
 def test_name_ending_in_prefix_letter_is_not_a_string() raises:
     assert_equal(kinds('bar("x")\n'), String('0:bar 3:( 2:"x" 3:)'))
 

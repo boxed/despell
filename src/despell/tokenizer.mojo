@@ -68,7 +68,7 @@ def split_lines(source: String) -> List[String]:
 
 # operators by length, space separated (and padded, for `find`)
 comptime _OPS3 = " **= //= >>= <<= ... "
-comptime _OPS2 = " -> ** // << >> <= >= == != := += -= *= /= %= &= |= ^= @= "
+comptime _OPS2 = " -> ** // << >> <= >= == != <> := += -= *= /= %= &= |= ^= @= "
 comptime _OPS1 = " + - * / % & | ^ ~ < > ( ) [ ] { } , : . ; @ = ! "
 
 
@@ -102,6 +102,11 @@ def _is_prefix_char(b: Int) -> Bool:
 
 def tokenize(source: String) raises -> TokenizedSource:
     var lines = split_lines(source)
+    var offsets = List[Int]()  # of each line in `source`
+    var at = 0
+    for l in lines:
+        offsets.append(at)
+        at += l.byte_length()
     var tokens = List[Token]()
     var in_string_lines = Set[Int]()
     var depth = 0
@@ -145,7 +150,7 @@ def tokenize(source: String) raises -> TokenizedSource:
         if (qc == ord('"') or qc == ord("'")) and (
             q == col or col == 0 or not _is_name_char(_at(text, col - 1))
         ):
-            var end = _read_string(lines, line_no, col, q, tokens, in_string_lines)
+            var end = _read_string(source, offsets, lines, line_no, col, q, tokens, in_string_lines)
             line_no = end[0]
             col = end[1]
             continue
@@ -243,45 +248,115 @@ def _number_end(text: String, col: Int) -> Int:
 
 
 def _read_string(
-    lines: List[String], start_line: Int, start_col: Int, quote_col: Int, mut tokens: List[Token],
-    mut in_string_lines: Set[Int],
+    source: String, offsets: List[Int], lines: List[String], start_line: Int, start_col: Int, quote_col: Int,
+    mut tokens: List[Token], mut in_string_lines: Set[Int],
 ) raises -> Tuple[Int, Int]:
+    """Read the string literal at `start_col` (its prefix) of `start_line`,
+    the way Mojo's lexer does (`Lexer.cpp`): escapes, a backslash-newline
+    continuing a single-quoted string, and in a t-string the interpolations,
+    which can hold strings of their own. Returns where it ends."""
+    var b = source.as_bytes()
     var first = lines[start_line]
-    var qc = _at(first, quote_col)
-    var triple = _at(first, quote_col + 1) == qc and _at(first, quote_col + 2) == qc
-    var quote_len = 3 if triple else 1
+    var t_string = False
+    for i in range(start_col, quote_col):
+        var p = _at(first, i)
+        if p == ord("t") or p == ord("T"):
+            t_string = True
+    var qpos = offsets[start_line] + quote_col
+    var qc = Int(b[qpos])
+    var triple = _triple_at(b, qpos, qc)
+    var stop = _skip_body(b, qpos + (3 if triple else 1), qc, triple, t_string, 0)
+    if stop < 0:
+        raise Error("unterminated string at line " + String(start_line + 1))
+    # back to a line and column
     var line_no = start_line
-    var pos = quote_col + quote_len
-    while True:
-        var text = lines[line_no]
-        var n = text.byte_length()
-        while pos < n:
-            var ch = _at(text, pos)
-            if ch == ord("\\"):
-                pos += 2
-                continue
-            if ch == qc and (not triple or (_at(text, pos + 1) == qc and _at(text, pos + 2) == qc)):
-                pos += quote_len
-                var value: String
-                if start_line == line_no:
-                    value = String(text[byte=start_col:pos])
-                else:
-                    value = String(first[byte=start_col:])
-                    for i in range(start_line + 1, line_no):
-                        value += lines[i]
-                    value += String(text[byte=0:pos])
-                tokens.append(Token(STRING, value, start_line, start_col, line_no, pos))
-                return (line_no, pos)
-            if ch == ord("\n") and not triple:
-                raise Error("unterminated string at line " + String(start_line + 1))
-            pos += 1
-        if not triple:
-            raise Error("unterminated string at line " + String(start_line + 1))
+    while line_no + 1 < len(offsets) and offsets[line_no + 1] <= stop - 1:
         line_no += 1
-        pos = 0
-        if line_no >= len(lines):
-            raise Error("unterminated string at line " + String(start_line + 1))
         in_string_lines.add(line_no)
+    var col = stop - offsets[line_no]
+    var start = offsets[start_line] + start_col
+    tokens.append(Token(STRING, String(source[byte=start:stop]), start_line, start_col, line_no, col))
+    return (line_no, col)
+
+
+def _triple_at(b: Span[UInt8, _], pos: Int, qc: Int) -> Bool:
+    return pos + 2 < len(b) and Int(b[pos + 1]) == qc and Int(b[pos + 2]) == qc
+
+
+def _skip_body(b: Span[UInt8, _], start: Int, qc: Int, triple: Bool, t_string: Bool, depth: Int) -> Int:
+    """The offset just past the closing quote of a string body starting at
+    `start`, or -1 (Mojo's `skipTStringBody`, and `consumeStringBody` for
+    other strings)."""
+    var pos = start
+    var n = len(b)
+    while pos < n:
+        var c = Int(b[pos])
+        if c == ord("\\"):
+            pos += 2
+            continue
+        if t_string and (c == ord("{") or c == ord("}")):
+            if pos + 1 < n and Int(b[pos + 1]) == c:
+                pos += 2  # {{ and }} are literal braces
+                continue
+            if c == ord("{"):
+                pos = _interpolation_end(b, pos, depth)
+                if pos < 0:
+                    return -1
+                continue
+            pos += 1
+            continue
+        if c == qc and (not triple or _triple_at(b, pos, qc)):
+            return pos + (3 if triple else 1)
+        if (c == ord("\n") or c == ord("\r")) and not triple:
+            return -1
+        pos += 1
+    return -1
+
+
+def _interpolation_end(b: Span[UInt8, _], start: Int, depth: Int) -> Int:
+    """The offset just past the `}` closing the t-string interpolation at
+    `start` (Mojo's `findTStringInterpolationEnd`), or -1."""
+    if depth > 20:
+        return -1
+    var pos = start + 1
+    var n = len(b)
+    var braces = 1
+    while pos < n:
+        var c = Int(b[pos])
+        if c == ord("{"):
+            braces += 1
+            pos += 1
+        elif c == ord("}"):
+            braces -= 1
+            pos += 1
+            if braces == 0:
+                return pos
+        elif c == ord("\\"):
+            pos += 2
+        elif c == ord("'") or c == ord('"'):
+            var triple = _triple_at(b, pos, c)
+            pos = _skip_body(b, pos + (3 if triple else 1), c, triple, False, depth + 1)
+            if pos < 0:
+                return -1
+        elif _is_prefix_char(c) and (pos == 0 or not _is_name_char(Int(b[pos - 1]))):
+            # r"..", t"..", rt"..", tr"..": a string after its prefix
+            var q = pos
+            var t = False
+            while q < n and q - pos < 2 and _is_prefix_char(Int(b[q])):
+                if Int(b[q]) == ord("t") or Int(b[q]) == ord("T"):
+                    t = True
+                q += 1
+            if q < n and (Int(b[q]) == ord("'") or Int(b[q]) == ord('"')):
+                var qc = Int(b[q])
+                var triple = _triple_at(b, q, qc)
+                pos = _skip_body(b, q + (3 if triple else 1), qc, triple, t, depth + 1)
+                if pos < 0:
+                    return -1
+            else:
+                pos = q
+        else:
+            pos += 1
+    return -1
 
 
 def indent_of(line: String) -> Int:

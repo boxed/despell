@@ -8,6 +8,8 @@ version = "0.1.0"
 [tasks]
 build = "mkdir -p build && mojo build -I src src/main.mojo -o build/despell"
 test = { cmd = "bash scripts/test.sh", depends-on = ["build"] }
+# despell's tokenizer against Mojo's own lexer (needs Homebrew's llvm@22)
+check-lexer = "bash tools/lexer_oracle/check.sh"
 
 [dependencies]
 mojo = ">=1.2.0,<2"

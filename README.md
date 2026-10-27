@@ -222,6 +222,19 @@ pixi run build        # writes build/despell
 pixi run test         # builds, then runs every tests/test_*.mojo
 ```
 
+```
+pixi run check-lexer  # despell's tokenizer against Mojo's own lexer
+```
+
+despell's tokenizer is its own (there's no Mojo parser to use: the compiler
+type-checks as it parses, into MLIR), but `check-lexer` holds it to the
+compiler's: it builds `Mojo/lib/MojoParser/Lexer.cpp` from Modular's open
+source compiler (Apache 2.0, pinned in `tools/lexer_oracle/COMMIT`, fetched,
+not vendored) with stand-ins for the rest of the compiler, and compares the
+tokens of the Mojo stdlib, the compiler's parser tests and despell's own
+sources (and any paths given) with despell's. It needs Homebrew's `llvm@22`
+(or `LLVM_CONFIG`). Bump `COMMIT` to check against a newer Mojo.
+
 `tests/test_e2e.mojo` runs the built binary on a copy of
 `e2e_projects/simple` and compares every mutant's status with
 `tests/e2e_expected.txt`.
