@@ -219,11 +219,43 @@ struct State(Movable):
     # directory and "sources" for the code under test; and "functions", what
     # each function number stood for then ("<file>::<name>" per line)
     var snapshots: Dict[String, Dict[String, String]]
+    # the snapshot the mutants' numbers and lines are from ("": not known)
+    var numbered: String
 
     def __init__(out self):
         self.mutants = Dict[String, MutantRecord]()
         self.tests = Dict[String, TestRecord]()
         self.snapshots = Dict[String, Dict[String, String]]()
+        self.numbered = String("")
+
+    def tests_reaching(self, m: MutantRecord) -> Tuple[List[String], Bool]:
+        """The tests that reach `m`, and whether that's exact: coverage
+        measured on other code is by numbers that have shifted since, so
+        then it's the tests that reached its function, by name."""
+        var out = List[String]()
+        var exact = True
+        var sources = String("")
+        try:
+            if self.numbered in self.snapshots:
+                sources = self.snapshots[self.numbered].get("sources", "")
+        except:
+            pass
+        var name = m.file + "::" + m.function
+        for item in self.tests.items():
+            ref t = item.value
+            var snap = self.snapshots.get(t.snapshot, Dict[String, String]())
+            if sources.byte_length() and snap.get("sources", "") == sources:
+                if t.covers(m):
+                    out.append(item.key)
+                continue
+            exact = False
+            var names = snap.get("functions", "").split("\n")
+            for fid in t.functions:
+                if fid < len(names) and names[fid] == name:
+                    out.append(item.key)
+                    break
+        sort(out)
+        return (out^, exact)
 
 
 def state_path(config: Config) -> String:
@@ -269,6 +301,7 @@ def read_state(config: Config) raises -> State:
         for k in range(len(s.keys)):
             snap[s.keys[k]] = s.items[k].as_string()
         state.snapshots[snapshots.keys[i]] = snap^
+    state.numbered = data.str_or("numbered", "")
     return state^
 
 
@@ -278,6 +311,7 @@ def by_number(a: MutantRecord, b: MutantRecord) -> Bool:
 
 def write_state(config: Config, state: State) raises:
     var used = Set[String]()
+    used.add(state.numbered)
     var mutants = List[MutantRecord]()
     for item in state.mutants.items():
         mutants.append(item.value.copy())
@@ -302,6 +336,7 @@ def write_state(config: Config, state: State) raises:
                 s.set(kv.key, Json.of(kv.value))
             snaps.set(item.key, s^)
     data.set("snapshots", snaps^)
+    data.set("numbered", _opt(state.numbered))
     var path = state_path(config)
     var tmp = path + "." + String(getpid()) + ".tmp"
     write_text(tmp, encode(data, indent=1))
@@ -406,7 +441,7 @@ def merge_result(ours: MutantRecord, theirs: Optional[MutantRecord], seen: Optio
         return ours.copy()  # new, or the code changed
     ref t = theirs.value()
     if not ran_it:
-        var kept = t.copy()
+        var kept = _result_of(ours, t)
         kept.compiles = t.compiles or ours.compiles
         kept.eq_checked = max(t.eq_checked, ours.eq_checked)
         return kept^
@@ -415,8 +450,21 @@ def merge_result(ours: MutantRecord, theirs: Optional[MutantRecord], seen: Optio
         # another run killed it meanwhile, with other tests: a kill stands
         # while the test file that did it is unchanged, which the next run
         # checks
-        return t.copy()
+        return _result_of(ours, t)
     return ours.copy()
+
+
+def _result_of(ours: MutantRecord, theirs: MutantRecord) -> MutantRecord:
+    """`ours` (where the mutant is now: its line and numbers shift when code
+    above it changes) with `theirs`' result."""
+    var m = ours.copy()
+    m.status = theirs.status
+    m.killed_by = theirs.killed_by
+    m.detail = theirs.detail
+    m.tested_with = theirs.tested_with
+    m.compiles = theirs.compiles
+    m.eq_checked = theirs.eq_checked
+    return m^
 
 
 def matches(m: MutantRecord, selectors: List[String]) -> Bool:

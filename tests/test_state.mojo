@@ -3,7 +3,7 @@ from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
 from despell.fsutil import mkdirs, real_path, rmtree
 from despell.project import load_config
-from despell.state import KILLED, SURVIVED, MutantRecord, State, merge_result, plan, read_state, write_state
+from despell.state import KILLED, SURVIVED, MutantRecord, State, TestRecord, merge_result, plan, read_state, write_state
 from despell.sysutil import monotonic_ns, seconds_since
 
 
@@ -81,6 +81,52 @@ def test_merging_keeps_a_kill_another_run_saved_meanwhile() raises:
     assert_equal(merge_result(survived, killed.copy(), killed.copy(), True).status, String(SURVIVED))
     assert_equal(merge_result(survived, killed.copy(), before.copy(), False).status, String(KILLED))
     assert_equal(merge_result(survived, mutant(KILLED, "other code"), None, False).status, String(SURVIVED))
+
+
+def test_a_result_kept_from_before_moves_with_the_code() raises:
+    # lines added above the function: same code, new line and numbers
+    var moved = MutantRecord("m.f.1", 7, 3, "src/m.mojo", 11, 1, 2, "f", "`<` -> `<=`", "<", "<=", "abc", 40)
+    var saved = merge_result(moved, mutant(KILLED, "abc", "s1", "tests/a.mojo::test_x"), None, False)
+    assert_equal(saved.status, String(KILLED))
+    assert_equal(saved.killed_by, String("tests/a.mojo::test_x"))
+    assert_equal(saved.line, 11)
+    assert_equal(saved.number, 7)
+    assert_equal(saved.site, 40)
+
+
+def test_coverage_from_other_code_reaches_by_function_name() raises:
+    var state = State()
+    var now = snap()
+    now["sources"] = "new"
+    state.snapshots["now"] = now^
+    var before = snap()
+    before["functions"] = "src/m.mojo::g\nsrc/m.mojo::f\n"
+    state.snapshots["before"] = before^
+    state.numbered = "now"
+    var m = mutant()  # in f, function 0 and site -1 now
+    m.site = 5
+    var fresh = TestRecord("tests/a.mojo::test_fresh", "tests/a.mojo", "test_fresh")
+    fresh.snapshot = "now"
+    fresh.sites = [5]
+    var old_f = TestRecord("tests/b.mojo::test_f", "tests/b.mojo", "test_f")
+    old_f.snapshot = "before"
+    old_f.functions = [1]  # f, then
+    old_f.sites = [5]  # some other statement, then
+    var old_g = TestRecord("tests/b.mojo::test_g", "tests/b.mojo", "test_g")
+    old_g.snapshot = "before"
+    old_g.functions = [0]
+    old_g.sites = [5]
+    state.tests[fresh.id] = fresh^
+    state.tests[old_f.id] = old_f^
+    state.tests[old_g.id] = old_g^
+    var reaching = state.tests_reaching(m)
+    assert_equal(len(reaching[0]), 2)
+    assert_equal(reaching[0][0], String("tests/a.mojo::test_fresh"))
+    assert_equal(reaching[0][1], String("tests/b.mojo::test_f"))
+    assert_false(reaching[1])
+    _ = state.tests.pop("tests/b.mojo::test_f")
+    _ = state.tests.pop("tests/b.mojo::test_g")
+    assert_true(state.tests_reaching(m)[1])
 
 
 def test_a_build_remembers_what_compiles_for_mutants_it_didnt_run() raises:

@@ -1,8 +1,10 @@
+from std.ffi import external_call
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
-from despell.fsutil import hash_text, join, parent, relative_to, basename
+from despell.fsutil import hash_text, join, parent, real_path, relative_to, basename
 from despell.jsonio import Json, encode, parse
-from despell.sysutil import ProcessPool, cpu_ticks, environment, memory_available
+from despell.fsutil import mkdirs, rmtree, write_text
+from despell.sysutil import ProcessPool, cpu_ticks, environment, kill_strays, lock_file, memory_available, run_command, unlock_file
 from despell.toml import read_table
 
 
@@ -85,6 +87,49 @@ def test_cpu_ticks_count_up() raises:
     var b = cpu_ticks()
     assert_true(a.total > 0 and a.idle <= a.total, String(a.idle) + " " + String(a.total))
     assert_true(b.total > a.total and b.idle >= a.idle, String(spin))
+
+
+def test_children_dont_inherit_locks() raises:
+    # one outliving us would hold the lock forever
+    mkdirs("tmp/infra")
+    var lock = lock_file("tmp/infra/held.lock", False)
+    assert_true(lock >= 0)
+    var pool = ProcessPool()
+    var argv = List[String]()
+    for a in ["sleep", "5"]:
+        argv.append(String(a))
+    pool.start(1, argv, ".", environment(), 20)
+    unlock_file(lock)
+    var again = lock_file("tmp/infra/held.lock", False)
+    assert_true(again >= 0)
+    unlock_file(again)
+    pool.kill_all()
+
+
+def test_strays_are_killed() raises:
+    rmtree("tmp/infra/strays")
+    mkdirs("tmp/infra/strays/.despell/bin")
+    # a program of our own (a copy of a system one doesn't run)
+    write_text("tmp/infra/strays/sleepy.mojo", "from std.time import sleep\n\n\ndef main():\n    sleep(30.0)\n")
+    var build = List[String]()
+    for a in ["mojo", "build", "tmp/infra/strays/sleepy.mojo", "-o", "tmp/infra/strays/.despell/bin/sleepy"]:
+        build.append(String(a))
+    assert_equal(run_command(build, ".", environment()).code, 0)
+    var pool = ProcessPool()
+    var argv = List[String]()
+    for a in ["tmp/infra/strays/.despell/bin/sleepy", "30"]:
+        argv.append(String(a))
+    pool.start(1, argv, ".", environment(), 60)
+    var other = List[String]()
+    for a in ["sleep", "30"]:
+        other.append(String(a))
+    pool.start(2, other, ".", environment(), 60)
+    _ = external_call["usleep", Int32](UInt32(200000))
+    assert_equal(kill_strays(real_path("tmp/infra/strays/.despell")), 1)
+    var f = pool.wait_any()
+    assert_equal(f.tag, 1)
+    assert_true(f.seconds < 5, String(f.seconds))
+    pool.kill_all()
 
 
 def test_hash_is_stable() raises:

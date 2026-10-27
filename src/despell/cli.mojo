@@ -413,16 +413,14 @@ def cmd_show(args: List[String]) raises -> Int:
             hidden[m.status] = hidden.get(m.status, 0) + 1
     var state = load_state(config)
     var out = Json.array()
+    var measured_here = List[Bool]()
     for m in mutants:
-        var covering = List[String]()
-        for item in state.tests.items():
-            if item.value.covers(m):
-                covering.append(item.key)
-        sort(covering)
+        var covering = state.tests_reaching(m)
         var entry = m.to_json()
         entry.set("diff", Json.of(mutant_diff(m, config.root)))
-        entry.set("covering_tests", Json.strings(covering))
+        entry.set("covering_tests", Json.strings(covering[0]))
         out.append(entry^)
+        measured_here.append(covering[1])
     if as_json:
         print(encode(out, indent=1))
         return 0
@@ -439,7 +437,10 @@ def cmd_show(args: List[String]) raises -> Int:
             print("  detail: " + m.detail)
         var covering = out.items[k].str_list("covering_tests")
         var tests_line = _tests_text(covering)
-        var reaching = m.function if m.site < 0 else "line " + String(m.line)
+        var reaching = m.function if m.site < 0 or not measured_here[k] else "line " + String(m.line)
+        if not measured_here[k]:
+            # the code changed since some of the coverage was measured
+            reaching += " (when last measured)"
         # a function's mutants are mostly reached by the same tests
         var seen = said.get(tests_line, "")
         if seen.byte_length() and len(covering) > 0:

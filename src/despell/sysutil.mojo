@@ -7,6 +7,7 @@ one thread with `poll`.
 """
 
 from std.ffi import external_call
+from std.os import listdir
 from std.sys.info import CompilationTarget
 
 from .textutil import split_lines
@@ -288,7 +289,12 @@ def lock_file(path: String, wait: Bool) -> Int:
     var fd: Int32
     try:
         var f = open(path, "a")
-        fd = external_call["dup", Int32](Int32(f._get_raw_fd()))
+        comptime if CompilationTarget.is_macos():
+            # (children don't get it: see `_POSIX_SPAWN_CLOEXEC_DEFAULT`)
+            fd = external_call["dup", Int32](Int32(f._get_raw_fd()))
+        else:
+            # F_DUPFD_CLOEXEC: a test process outliving us mustn't hold it
+            fd = external_call["fcntl", Int32](Int32(f._get_raw_fd()), Int32(1030), Int32(0))
         f.close()
     except:
         return -1
@@ -299,6 +305,72 @@ def lock_file(path: String, wait: Bool) -> Int:
         _ = external_call["close", Int32](fd)
         return -1
     return Int(fd)
+
+
+def _executable_of(pid: Int32) -> String:
+    """The path of the program process `pid` runs ("" if unknown)."""
+    comptime if CompilationTarget.is_macos():
+        var buf = alloc_zero(4096)
+        var n = Int(external_call["proc_pidpath", Int32](pid, buf.unsafe_ptr(), UInt32(4096)))
+        if n <= 0:
+            return ""
+        return String(from_utf8_lossy=Span(buf)[0:n])
+    else:
+        var link = c_string("/proc/" + String(pid) + "/exe")
+        var buf = alloc_zero(4096)
+        var n = external_call["readlink", Int](link.unsafe_ptr(), buf.unsafe_ptr(), 4095)
+        if n <= 0:
+            return ""
+        return String(from_utf8_lossy=Span(buf)[0:n])
+
+
+def _all_pids() -> List[Int32]:
+    var out = List[Int32]()
+    comptime if CompilationTarget.is_macos():
+        var buf = alloc_zero(4 * 65536)
+        var n = Int(external_call["proc_listallpids", Int32](buf.unsafe_ptr(), Int32(4 * 65536)))
+        var p = buf.unsafe_ptr().unsafe_bitcast[Int32]()
+        for i in range(max(0, min(n, 65536))):
+            out.append(p[unsafe_offset=i])
+    else:
+        try:
+            for name in listdir("/proc"):
+                try:
+                    out.append(Int32(Int(atol(name))))
+                except:
+                    pass
+        except:
+            pass
+    return out^
+
+
+def _parent_of(pid: Int32) -> Int:
+    """The parent process of `pid` (-1 if unknown)."""
+    try:
+        var argv = List[String]()
+        for a in ["ps", "-o", "ppid=", "-p", String(pid)]:
+            argv.append(String(a))
+        return Int(atol(String(run_command(argv, ".", environment()).output.strip())))
+    except:
+        return -1
+
+
+def kill_strays(dir: String, orphans_only: Bool = False) -> Int:
+    """Kill the processes (and their process groups) running a program from
+    `dir`: test processes a despell run that died left behind. With
+    `orphans_only`, only those whose parent is gone, which no live run can
+    be waiting for. Returns how many."""
+    var prefix = dir if dir.endswith("/") else dir + "/"
+    var me = Int32(getpid())
+    var killed = 0
+    for pid in _all_pids():
+        if pid <= 1 or pid == me:
+            continue
+        if _executable_of(pid).startswith(prefix) and (not orphans_only or _parent_of(pid) == 1):
+            _ = external_call["kill", Int32](-pid, _SIGKILL)
+            _ = external_call["kill", Int32](pid, _SIGKILL)
+            killed += 1
+    return killed
 
 
 def unlock_file(fd: Int):
@@ -312,6 +384,9 @@ comptime _SIGKILL: Int32 = 9
 comptime _WNOHANG: Int32 = 1
 comptime _POLLIN: Int16 = 0x0001
 comptime _POSIX_SPAWN_SETPGROUP: Int16 = 0x0002
+# macOS: the child gets only the descriptors the file actions give it, so
+# not despell's locks, which one outliving despell would otherwise hold
+comptime _POSIX_SPAWN_CLOEXEC_DEFAULT: Int16 = 0x4000
 comptime _O_RDONLY: Int32 = 0
 
 
@@ -439,9 +514,10 @@ struct ProcessPool(Movable, Sized):
 
         var attr = alloc_zero(256)
         _ = external_call["posix_spawnattr_init", Int32](attr.unsafe_ptr())
-        _ = external_call["posix_spawnattr_setflags", Int32](
-            attr.unsafe_ptr(), _POSIX_SPAWN_SETPGROUP | _POSIX_SPAWN_SETSIGMASK
-        )
+        var flags = _POSIX_SPAWN_SETPGROUP | _POSIX_SPAWN_SETSIGMASK
+        comptime if CompilationTarget.is_macos():
+            flags |= _POSIX_SPAWN_CLOEXEC_DEFAULT
+        _ = external_call["posix_spawnattr_setflags", Int32](attr.unsafe_ptr(), flags)
         _ = external_call["posix_spawnattr_setpgroup", Int32](attr.unsafe_ptr(), Int32(0))
         # despell blocks SIGINT and SIGTERM for itself; the child shouldn't
         var no_signals = _signal_set(False)

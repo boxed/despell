@@ -6,14 +6,14 @@ from std.os import getenv
 from .equivalence import EQ_VERSION
 from .fsutil import join, mkdirs, rmtree, write_text, hash_text
 from .project import Config
-from .runner import Command, Run, discover_tests, log, run_parallel
+from .runner import WORK_DIR, Command, Run, discover_tests, log, run_parallel
 from .state import (
     COMPILE_ERROR, EQUIVALENT, KILLED, MAIN_LOCK, NO_TESTS, NOT_CHECKED, SIDE_DIR, SKIPPED, SURVIVED, TIMEOUT, MutantRecord, Plan, State,
     StateLock, TestRecord, is_actionable, matches, merge_result, plan, read_state, snapshot_id, test_file_hashes,
     write_state,
 )
 from .sysutil import (
-    CpuTicks, Finished, children_cpu_seconds, cpu_ticks, getpid, lock_file, memory_available, monotonic_ns, seconds_since,
+    CpuTicks, Finished, children_cpu_seconds, cpu_ticks, getpid, kill_strays, lock_file, memory_available, monotonic_ns, seconds_since,
     unlock_file, with_env,
 )
 from .textutil import first_failed_test, format_seconds, numbers_after, split_lines
@@ -534,6 +534,7 @@ def _save(mut r: Run, config: Config, before: State, current: Dict[String, Strin
     var saved = current.copy()
     saved[FUNCTIONS] = _function_names(r)
     state.snapshots[snap] = saved^
+    state.numbered = snap
     write_state(config, state)
     lock.release()
     return state^
@@ -739,8 +740,18 @@ def run(
     running mutants follows the CPU the tests use, starting at `workers`."""
     # mutants/ itself, or a private copy beside it if another run has it
     mkdirs(config.mutants_dir())
+    # test processes of a run that died (in mutants/ or a side copy) hold a
+    # CPU, and with older despells, which let them inherit it, its lock
+    var orphans = kill_strays(config.mutants_dir(), orphans_only=True)
     var main_lock = lock_file(join(config.mutants_dir(), MAIN_LOCK), False)
     var tree = config.mutants_dir()
+    if orphans > 0:
+        log("stopped " + String(orphans) + " test processes an earlier despell run left running")
+    if main_lock >= 0:
+        # with the lock, nothing alive uses this tree's test binaries
+        var strays = kill_strays(join(tree, WORK_DIR))
+        if strays > 0:
+            log("stopped " + String(strays) + " test processes an earlier despell run left running")
     if main_lock < 0:
         tree = join(join(config.mutants_dir(), SIDE_DIR), String(getpid()))
         log("another despell run is using mutants/; this one works in mutants/" + String(SIDE_DIR) + "/" + String(getpid()))
