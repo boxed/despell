@@ -7,7 +7,7 @@ from .fsutil import join, mkdirs, rmtree, write_text, hash_text
 from .project import Config
 from .runner import Command, Run, discover_tests, log, run_parallel
 from .state import (
-    COMPILE_ERROR, KILLED, MAIN_LOCK, NO_TESTS, SIDE_DIR, SKIPPED, SURVIVED, TIMEOUT, MutantRecord, Plan, State,
+    COMPILE_ERROR, KILLED, MAIN_LOCK, NO_TESTS, NOT_CHECKED, SIDE_DIR, SKIPPED, SURVIVED, TIMEOUT, MutantRecord, Plan, State,
     StateLock, TestRecord, is_actionable, matches, merge_result, plan, read_state, snapshot_id, test_file_hashes,
     write_state,
 )
@@ -689,7 +689,7 @@ def _files_to_build(
     var needed = Set[String]()
     var full = List[Int]()
     for n in selected:
-        var p = plans.get(n, Plan(True, True, Set[String]()))
+        var p = plans.get(n, Plan(True, True, Set[String](), False))
         if p.all_files:
             full.append(n)
         else:
@@ -805,7 +805,7 @@ def _run(
         if len(selectors) == 0 or matches(m, selectors):
             chosen.append(m.number)
             if force:
-                plans[m.number] = Plan(True, True, Set[String]())
+                plans[m.number] = Plan(True, True, Set[String](), False)
     if len(selectors) > 0 and len(chosen) == 0:
         raise Error("no mutants match " + _joined(selectors))
     var selected = List[Int]()
@@ -823,6 +823,10 @@ def _run(
         return _records(state, r, chosen)
     for n in selected:
         r.mutants[n - 1].tested_with = snap
+        if plans[n].retry:
+            # if the changed files don't even reach it any more, the old
+            # kill doesn't stand either
+            r.mutants[n - 1].status = NOT_CHECKED
         if not plans[n].all_files:
             r.allowed[n] = plans[n].files.copy()
     # Only the selected mutants go into the build, and only the test files
@@ -866,6 +870,21 @@ def _run(
     for n in selected:
         fresh.add(r.mutants[n - 1].id)
     var state = _save(r, config, before, current, snap, fresh)
+    # killed by a test file that changed, and it no longer does
+    var again = List[String]()
+    for n in selected:
+        ref m = r.mutants[n - 1]
+        if plans[n].retry and m.status != KILLED and m.status != TIMEOUT:
+            again.append(m.id)
+    if len(again) > 0:
+        log(
+            String(len(again)) + " mutants are no longer killed by the test files that changed; running them against "
+            + "every test that reaches them"
+        )
+        _ = _run(config, again, workers, tree, True, adaptive)
+        var relock = StateLock(config)
+        state = read_state(config)
+        relock.release()
     log("done in " + format_seconds(seconds_since(t0)) + "s")
     if len(selectors) > 0:
         return _records(state, r, chosen)

@@ -53,10 +53,18 @@ def test_survivor_runs_against_new_and_changed_test_files_only() raises:
 def test_killed_stays_killed_while_its_killer_is_unchanged() raises:
     var old = mutant(KILLED, "abc", "s1", "tests/a.mojo::test_x")
     assert_false(plan(mutant(), old.copy(), snapshots(), snap("changed")).run)
+    # when it changes, it's tried first, and everything else only if it no
+    # longer kills it
     var now = snap()
     now["tests/a.mojo"] = "changed"
-    var p = plan(mutant(), old^, snapshots(), now)
-    assert_true(p.run and p.all_files)
+    var p = plan(mutant(), old.copy(), snapshots(), now)
+    assert_true(p.run and not p.all_files and p.retry)
+    assert_true("tests/a.mojo" in p.files)
+    # and when it's gone, everything that reaches it is
+    var gone = snap()
+    _ = gone.pop("tests/a.mojo")
+    p = plan(mutant(), old^, snapshots(), gone)
+    assert_true(p.run and p.all_files and not p.retry)
 
 
 def test_changed_shared_test_code_runs_everything() raises:

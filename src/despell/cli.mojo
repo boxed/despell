@@ -49,7 +49,10 @@ Workflow:
 A plain `despell run` runs every mutant without an up-to-date result: an
 interrupted run continues where it stopped, changed code is re-checked,
 killed mutants stay killed while the test file that killed them is
-unchanged, and survivors are re-run against new or changed test files only.
+unchanged (when it changes, it's tried first, and every other test that
+reaches the mutant only if it no longer kills it, so adding tests to the
+same file stays quick), and survivors are re-run against new or changed
+test files only.
 A change to shared test code (anything under tests_dir that isn't a test
 file) re-runs everything. `despell run --force <selector>` re-runs the
 selected mutants against every test that reaches them, whatever their

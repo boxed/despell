@@ -76,7 +76,9 @@ Results live in `mutants/despell.json`, saved as the run goes. Each result
 remembers the test files it was obtained with, so a plain `despell run` only
 runs what could have changed: mutants without a result (an interrupted run
 continues where it stopped), changed code, killed mutants whose killing test
-file changed, and survivors against new or changed test files. A change to
+file changed (against that file first, and every other test that reaches them
+only if it no longer kills them), and survivors against new or changed test
+files. A change to
 shared test code re-runs everything. `despell run --force <selector>` re-runs
 the selected mutants whatever their results. Delete `mutants/` to start over.
 

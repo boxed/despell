@@ -342,25 +342,27 @@ def snapshot_id(snapshot: Dict[String, String]) -> String:
 @fieldwise_init
 struct Plan(Copyable, Movable):
     """Whether a mutant needs running, and against which test files (with
-    `all_files`, every one that reaches it)."""
+    `all_files`, every one that reaches it). With `retry`, against every
+    one that reaches it if `files` don't kill it."""
 
     var run: Bool
     var all_files: Bool
     var files: Set[String]
+    var retry: Bool
 
 
 def plan(m: MutantRecord, old: Optional[MutantRecord], snapshots: Dict[String, Dict[String, String]], current: Dict[String, String]) -> Plan:
     """A killed mutant stays killed while the test file that killed it is the
     same. A survivor can only be killed by a test file that's new or changed
     since it was checked, so it's run against those alone."""
-    var everything = Plan(True, True, Set[String]())
+    var everything = Plan(True, True, Set[String](), False)
     if not old:
         return everything^
     ref o = old.value()
     if o.fingerprint != m.fingerprint:
         return everything^
     if o.status == COMPILE_ERROR or o.status == SKIPPED:
-        return Plan(False, True, Set[String]())  # the build carries these over
+        return Plan(False, True, Set[String](), False)  # the build carries these over
     if not is_final(o.status):
         return everything^
     if not (o.tested_with in snapshots):
@@ -375,12 +377,16 @@ def plan(m: MutantRecord, old: Optional[MutantRecord], snapshots: Dict[String, D
     if o.status == KILLED or o.status == TIMEOUT:
         var sep = o.killed_by.find("::")
         var killer = String(o.killed_by[byte=0:sep]) if sep >= 0 else o.killed_by
-        if killer in changed or not (killer in current):
+        if not (killer in current):
             return everything^
-        return Plan(False, True, Set[String]())
+        if killer in changed:
+            # It most likely still kills it (it's usually had tests added),
+            # and building just the changed files is quick.
+            return Plan(True, False, changed^, True)
+        return Plan(False, True, Set[String](), False)
     if len(changed) > 0:
-        return Plan(True, False, changed^)
-    return Plan(False, True, Set[String]())
+        return Plan(True, False, changed^, False)
+    return Plan(False, True, Set[String](), False)
 
 
 def merge_result(ours: MutantRecord, theirs: Optional[MutantRecord], seen: Optional[MutantRecord], ran_it: Bool) -> MutantRecord:

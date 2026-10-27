@@ -102,6 +102,22 @@ def test_4_run_continues_where_it_stopped() raises:
     assert_true("running 1 mutants" in forced and "1 mutants: 1 killed" in forced, forced)
 
 
+def test_4b_editing_the_killing_test_file_rechecks_with_it_first() raises:
+    # test_mathx killed add.1; edited, it's tried alone first, and only
+    # if it no longer kills the mutant, everything that reaches it is
+    var test_file = join(PROJECT, "tests/test_mathx.mojo")
+    var source = read_text(test_file)
+    write_text(test_file, source + "\n# a comment\n")
+    var out = despell("run", "-j", "4", "mylib.mathx.add.1")
+    assert_true("1 mutants: 1 killed" in out, out)
+    assert_false("no longer killed" in out, out)
+    write_text(test_file, source.replace("assert_equal(add(2, 3), 5)", "_ = add(2, 3)"))
+    out = despell("run", "-j", "4", "mylib.mathx.add.1")
+    write_text(test_file, source)
+    assert_true("1 mutants are no longer killed by the test files that changed" in out, out)
+    assert_equal(statuses()["mylib.mathx.add.1"], String("survived"))
+
+
 def test_5_rerun_single_mutant_after_adding_a_test() raises:
     var test_file = join(PROJECT, "tests/test_mathx.mojo")
     var source = read_text(test_file)
