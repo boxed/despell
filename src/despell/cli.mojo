@@ -89,7 +89,7 @@ commands:
   run [selector ...] [-j N] [--force]       generate mutants and test them (N workers; default: adapts to CPU use)
   results [selector ...] [--all] [--status s,s] [--json]
                                             list mutants from the last run (default: the ones to act on)
-  show <selector> ... [--json]              show diff, location and covering tests for mutants
+  show <selector> ... [--all] [--json]      show diff, location and covering tests (of the ones to act on)
   guide                                     explain the workflow, statuses and config (start here)
 """
 
@@ -149,7 +149,75 @@ def _summary(mutants: List[MutantRecord]):
     print(String(total) + " mutants: " + (join_words(parts, ", ") if len(parts) else String("none")) + score)
 
 
-def _report(mutants: List[MutantRecord]):
+# Beyond this many mutants to act on, list them per function instead
+comptime LIST_LIMIT = 50
+comptime FUNCTIONS_SHOWN = 40
+
+
+def _function_of(m: MutantRecord) -> String:
+    """The mutant's function, as a selector (its id without the number)."""
+    return String(m.id[byte = 0 : m.id.rfind(".")])
+
+
+def _print_by_function(mutants: List[MutantRecord]):
+    """One line per function, the ones with the most to act on first."""
+    var names = List[String]()
+    var counts = Dict[String, Int]()  # "<function> <status>" and "<function>"
+    var first = Dict[String, String]()  # function -> location
+    for m in _sorted(mutants):
+        var f = _function_of(m)
+        if not (f in first):
+            names.append(f)
+            first[f] = m.location()
+        counts[f] = counts.get(f, 0) + 1
+        counts[f + " " + m.status] = counts.get(f + " " + m.status, 0) + 1
+    var order = List[Int]()
+    for i in range(len(names)):
+        order.append(i)
+    # by count, then by location (insertion sort keeps that order)
+    for a in range(1, len(order)):
+        var b = a
+        while b > 0 and counts.get(names[order[b - 1]], 0) < counts.get(names[order[b]], 0):
+            var t = order[b - 1]
+            order[b - 1] = order[b]
+            order[b] = t
+            b -= 1
+    var shown = min(FUNCTIONS_SHOWN, len(order))
+    var tallies = List[String]()
+    var tally_w = 0
+    var name_w = 0
+    for k in range(shown):
+        var f = names[order[k]]
+        var parts = List[String]()
+        for status in String(STATUS_ORDER).split(" "):
+            var n = counts.get(f + " " + String(status), 0)
+            if n:
+                parts.append(String(n) + " " + String(status))
+        tallies.append(join_words(parts, ", "))
+        tally_w = max(tally_w, tallies[k].byte_length())
+        name_w = max(name_w, f.byte_length())
+    for k in range(shown):
+        var f = names[order[k]]
+        print("  " + _pad(tallies[k], tally_w) + "  " + _pad(f, name_w) + "  " + first.get(f, ""))
+    if len(order) > shown:
+        print("  ... and " + String(len(order) - shown) + " more functions (`despell results --all` lists every mutant)")
+
+
+def _print_actionable(mutants: List[MutantRecord], every: Bool):
+    """The mutants to act on: each, or for a long list without a selector,
+    per function."""
+    if every or len(mutants) <= LIST_LIMIT:
+        _print_table(_sorted(mutants), True)
+        print()
+        print("Next: `despell show <id or function>` to see the diffs and the tests that reach them.")
+        return
+    print(String(len(mutants)) + " to act on, in these functions (most first):")
+    _print_by_function(mutants)
+    print()
+    print("Next: `despell show <function>` to see a function's mutants and the tests that reach them.")
+
+
+def _report(mutants: List[MutantRecord], selected: Bool):
     _summary(mutants)
     var todo = List[MutantRecord]()
     for m in mutants:
@@ -157,10 +225,7 @@ def _report(mutants: List[MutantRecord]):
             todo.append(m.copy())
     if len(todo):
         print()
-        print("To act on:")
-        _print_table(_sorted(todo), True)
-        print()
-        print("Next: `despell show <id>` to see a mutant's diff and the tests that reach it.")
+        _print_actionable(todo, selected)
 
 
 def _root() raises -> String:
@@ -201,7 +266,7 @@ def cmd_run(args: List[String]) raises -> Int:
     # without -j, the number of workers adapts to the CPU the tests use
     var mutants = run(config, selectors, workers if workers > 0 else _default_workers(), force, workers == 0)
     print()
-    _report(mutants)
+    _report(mutants, len(selectors) > 0)
     return 0
 
 
@@ -257,12 +322,13 @@ def cmd_results(args: List[String]) raises -> Int:
         print(encode(arr, indent=1))
         return 0
     _summary(mutants)
-    if len(shown):
-        print()
-        _print_table(shown, True)
-    if not show_all and len(wanted) == 0 and len(shown):
-        print()
-        print("Next: `despell show <id>` to see a mutant's diff and the tests that reach it.")
+    if len(shown) == 0:
+        return 0
+    print()
+    if show_all or len(wanted) > 0:
+        _print_table(_sorted(shown), True)
+    else:
+        _print_actionable(shown, len(selectors) > 0)
     return 0
 
 
@@ -294,12 +360,34 @@ def mutant_diff(m: MutantRecord, root: String) raises -> String:
     return out^
 
 
+def _tests_text(tests: List[String]) -> String:
+    """The tests, or for many, how many per test file."""
+    if len(tests) == 0:
+        return "none"
+    if len(tests) <= 5:
+        return join_words(tests, ", ")
+    var files = List[String]()
+    var per = Dict[String, Int]()
+    for t in tests:
+        var file = String(t[byte = 0 : t.find("::")]) if "::" in t else t
+        if not (file in per):
+            files.append(file)
+        per[file] = per.get(file, 0) + 1
+    var parts = List[String]()
+    for f in files:
+        parts.append(f + " (" + String(per.get(f, 0)) + ")")
+    return String(len(tests)) + " tests in " + join_words(parts, ", ")
+
+
 def cmd_show(args: List[String]) raises -> Int:
     var selectors = List[String]()
     var as_json = False
+    var show_all = False
     for a in args:
         if a == "--json":
             as_json = True
+        elif a == "--all":
+            show_all = True
         elif a.startswith("-"):
             raise Error("unknown option for show: " + a)
         else:
@@ -307,7 +395,17 @@ def cmd_show(args: List[String]) raises -> Int:
     if len(selectors) == 0:
         raise Error("show needs at least one selector")
     var config = load_config(_root())
-    var mutants = _load_selected(config, selectors)
+    var exact = Set[String]()
+    for s in selectors:
+        exact.add(s)
+    var hidden = Dict[String, Int]()
+    var mutants = List[MutantRecord]()
+    for m in _sorted(_load_selected(config, selectors)):
+        # for a function or module, only what's left to act on
+        if as_json or show_all or is_actionable(m.status) or m.id in exact:
+            mutants.append(m.copy())
+        else:
+            hidden[m.status] = hidden.get(m.status, 0) + 1
     var state = load_state(config)
     var out = Json.array()
     for m in mutants:
@@ -323,6 +421,7 @@ def cmd_show(args: List[String]) raises -> Int:
     if as_json:
         print(encode(out, indent=1))
         return 0
+    var said = Dict[String, String]()  # tests text -> where it was printed
     for k in range(len(mutants)):
         ref m = mutants[k]
         if k:
@@ -334,10 +433,23 @@ def cmd_show(args: List[String]) raises -> Int:
         if m.detail.byte_length():
             print("  detail: " + m.detail)
         var covering = out.items[k].str_list("covering_tests")
-        var tests_line = join_words(covering, ", ") if len(covering) else String("none")
+        var tests_line = _tests_text(covering)
         var reaching = m.function if m.site < 0 else "line " + String(m.line)
-        print("  tests reaching " + reaching + ": " + tests_line)
+        # a function's mutants are mostly reached by the same tests
+        var seen = said.get(tests_line, "")
+        if seen.byte_length() and len(covering) > 0:
+            print("  tests reaching " + reaching + ": the same as " + seen)
+        else:
+            print("  tests reaching " + reaching + ": " + tests_line)
+            said[tests_line] = reaching
         print(String(out.items[k].str_or("diff", "").rstrip("\n")))
+    if len(hidden) > 0:
+        var parts = List[String]()
+        for item in hidden.items():
+            parts.append(String(item.value) + " " + item.key)
+        if len(mutants):
+            print()
+        print("(not shown: " + join_words(parts, ", ") + "; `despell show --all` shows them)")
     return 0
 
 

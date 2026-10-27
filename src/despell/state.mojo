@@ -207,7 +207,8 @@ struct State(Movable):
     var mutants: Dict[String, MutantRecord]
     var tests: Dict[String, TestRecord]
     # snapshot id -> hash per test file, "*" for the rest of the tests
-    # directory and "sources" for the code under test
+    # directory and "sources" for the code under test; and "functions", what
+    # each function number stood for then ("<file>::<name>" per line)
     var snapshots: Dict[String, Dict[String, String]]
 
     def __init__(out self):

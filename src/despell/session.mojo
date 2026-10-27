@@ -18,6 +18,8 @@ from .sysutil import (
 from .textutil import first_failed_test, format_seconds, numbers_after
 
 comptime STATS_MODE = "-1"
+# the snapshot entry naming each function number (see `_function_names`)
+comptime FUNCTIONS = "functions"
 # Building with this many mutants or more, test files without up-to-date
 # coverage are first built without mutants to measure it: then each binary
 # only gets the mutants its tests reach. DESPELL_COVERAGE_FIRST overrides it.
@@ -39,14 +41,35 @@ def _test_argv(r: Run, file: String, names: List[String]) -> List[String]:
     return argv^
 
 
-def _without_coverage(output: String) -> String:
-    """A test's output without the coverage lines despell's hooks print, and
-    without the tests `--only` skipped."""
+def _test_output(r: Run, output: String) -> String:
+    """A failing test's output for the user: without the coverage lines
+    despell's hooks print, the tests `--only` skipped and Mojo's boilerplate,
+    and with paths into despell's copies of the project made relative to it."""
     var out = String("")
     for line in output.splitlines():
-        if not (line.startswith("despell-hit ") or line.startswith("despell-site ") or line.strip().startswith("SKIP [")):
-            out += line + "\n"
+        var l = String(line)
+        var stripped = String(l.strip())
+        if (
+            l.startswith("despell-hit ") or l.startswith("despell-site ") or stripped.startswith("SKIP [")
+            or stripped.startswith("stack trace was not collected") or stripped == "Unhandled exception caught during execution:"
+            or stripped.startswith("Test suite'")
+        ):
+            continue
+        out += _relative_paths(l, r.mdir) + "\n"
     return String(out.strip())
+
+
+def _relative_paths(line: String, mdir: String) -> String:
+    """`line` with `<mdir>/` and `<mdir>/.despell/trees/<n>/` taken out."""
+    var out = line
+    var trees = mdir + "/.despell/trees/"
+    while trees in out:
+        var at = out.find(trees)
+        var after = out.find("/", at + trees.byte_length())
+        if after < 0:
+            break
+        out = String(out[byte=0:at]) + String(out[byte = after + 1 :])
+    return out.replace(mdir + "/", "")
 
 
 def _pass_unsandboxed(r: Run, commands: List[Command], failing: List[Int]) raises -> Bool:
@@ -96,7 +119,7 @@ def collect_stats(mut r: Run, only_files: Set[String] = Set[String]()) raises:
     if len(failing) > 0:
         var msg = String(len(failing)) + " tests fail without any mutation applied:\n"
         for k in range(min(5, len(failing))):
-            msg += "\n--- " + r.tests[indices[failing[k]]].id + "\n" + _without_coverage(results[failing[k]].output) + "\n"
+            msg += "\n--- " + r.tests[indices[failing[k]]].id + "\n" + _test_output(r, results[failing[k]].output) + "\n"
         if len(r.test_prefix) > 0 and _pass_unsandboxed(r, commands, failing):
             msg += (
                 "\nThey pass outside the sandbox despell runs tests in, which keeps them from signaling processes "
@@ -507,7 +530,9 @@ def _save(mut r: Run, config: Config, before: State, current: Dict[String, Strin
         for t in r.tests:
             tests[t.id] = t.copy()
         state.tests = tests^
-    state.snapshots[snap] = current.copy()
+    var saved = current.copy()
+    saved[FUNCTIONS] = _function_names(r)
+    state.snapshots[snap] = saved^
     write_state(config, state)
     lock.release()
     return state^
@@ -609,6 +634,48 @@ def _coverage(
     return stale_set^
 
 
+def _function_names(r: Run) -> String:
+    """`<file>::<name>` of each function, one line per function number:
+    coverage is saved by number, and numbers shift when the code changes."""
+    var names = List[String](length=r.n_functions, fill=String(""))
+    for m in r.mutants:
+        if m.fid < len(names):
+            names[m.fid] = m.file + "::" + m.function
+    var out = String("")
+    for n in names:
+        out += n + "\n"
+    return out^
+
+
+def _reaches_by_name(
+    ids: List[String], old_tests: Dict[String, TestRecord], snapshots: Dict[String, Dict[String, String]],
+    current: Dict[String, String], f: String, wanted: Set[String],
+) -> Optional[Bool]:
+    """Whether the tests `ids` of test file `f` reached any of the `wanted`
+    functions (`<file>::<name>`) when last measured, when only the code under
+    test changed since: then the function numbers have shifted, but the
+    functions the tests reach mostly haven't, like the results of mutants in
+    functions that didn't change. None when that can't be told."""
+    try:
+        for id in ids:
+            if not old_tests[id].complete:
+                return None
+        var snap_id = old_tests[ids[0]].snapshot
+        if not (snap_id in snapshots):
+            return None
+        ref snap = snapshots[snap_id]
+        if not (FUNCTIONS in snap) or snap.get("*", "") != current.get("*", "") or snap.get(f, "") != current.get(f, "-"):
+            return None
+        var names = snap[FUNCTIONS].split("\n")
+        for id in ids:
+            for fid in old_tests[id].functions:
+                if fid < len(names) and String(names[fid]) in wanted:
+                    return True
+        return False
+    except:
+        return None
+
+
 def _files_to_build(
     r: Run, selected: List[Int], plans: Dict[Int, Plan], old_tests: Dict[String, TestRecord],
     snapshots: Dict[String, Dict[String, String]], current: Dict[String, String],
@@ -635,6 +702,9 @@ def _files_to_build(
         var l = by_file.get(item.value.file, List[String]())
         l.append(item.key)
         by_file[item.value.file] = l^
+    var wanted = Set[String]()
+    for n in full:
+        wanted.add(r.mutants[n - 1].file + "::" + r.mutants[n - 1].function)
     for item in current.items():
         var f = item.key
         if f == "*" or f == "sources" or f in needed:
@@ -644,7 +714,9 @@ def _files_to_build(
             needed.add(f)  # coverage unknown: it might reach them
             continue
         if not _coverage_current(f, ids, old_tests, snapshots, current):
-            needed.add(f)
+            var by_name = _reaches_by_name(ids, old_tests, snapshots, current, f, wanted)
+            if not by_name or by_name.value():
+                needed.add(f)
             continue
         var reaches = False
         for id in ids:

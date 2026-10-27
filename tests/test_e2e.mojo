@@ -162,6 +162,18 @@ def test_7_coverage_first() raises:
     assert_true(a > 0 and b > 0 and a + b < 70, String(a) + " " + String(b))
 
 
+def test_7b_editing_the_code_keeps_rechecks_small() raises:
+    # a new function shifts the numbers of every mutant after it, but the
+    # tests that reached clamp before still tell which files to build
+    var path = join(PROJECT, "src/mylib/mathx.mojo")
+    var source = read_text(path)
+    write_text(path, source.replace("def add(", "def extra() -> Int:\n    return 1 + 1\n\n\ndef add("))
+    var out = despell("run", "-j", "4", "mylib.mathx.clamp")
+    write_text(path, source)
+    assert_true("building the 1 of 2 test files" in out, out)
+    assert_true("survived   mylib.mathx.clamp.1" in out, out)
+
+
 def test_8_mutants_cant_signal_other_processes() raises:
     # stopping a child is one mutant (`and` -> `or`) away from `kill(-1)`,
     # which signals every process the user has; SIGURG is harmless

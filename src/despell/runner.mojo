@@ -715,6 +715,7 @@ struct Run(Movable):
         """
         var enabled = Set[Int]()
         var disabled_functions = self.disabled_functions.copy()
+        var asked = self.enabled.copy()
         for n in self.enabled:
             if self.mutants[n - 1].status != SKIPPED:
                 enabled.add(n)
@@ -770,7 +771,8 @@ struct Run(Movable):
         self.disabled_functions = disabled_functions^
         self._write_manifest(manifest)
         var rejected = 0
-        for m in self.mutants:
+        for n in asked:
+            ref m = self.mutants[n - 1]
             if m.status == COMPILE_ERROR or m.status == SKIPPED:
                 rejected += 1
         log(
