@@ -1,7 +1,9 @@
 from std.collections import Set
 from std.testing import assert_equal, assert_true, TestSuite
 
-from despell.runner import add_exports, module_name
+from despell.fsutil import join, mkdirs, rmtree, write_text
+from despell.project import load_config
+from despell.runner import Run, add_exports, module_name
 
 
 def test_add_exports() raises:
@@ -34,6 +36,25 @@ def test_add_exports() raises:
 def test_module_names() raises:
     assert_equal(module_name("mylib/mathx.mojo"), String("mylib.mathx"))
     assert_equal(module_name("mylib/__init__.mojo"), String("mylib"))
+
+
+def test_overloads_get_distinct_mutant_ids() raises:
+    var root = "tmp/overloads"
+    rmtree(root)
+    mkdirs(join(root, "src/pkg"))
+    mkdirs(join(root, "tests"))
+    write_text(
+        join(root, "src/pkg/m.mojo"),
+        "def f(x: Int) -> Int:\n    return x + 1\n\n\ndef f(x: Int, y: Int) -> Int:\n    return x - y\n",
+    )
+    write_text(join(root, "tests/test_m.mojo"), "def main():\n    pass\n")
+    var r = Run(load_config(root), 1, join(root, "mutants"))
+    r.prepare()
+    var ids = Set[String]()
+    for m in r.mutants:
+        ids.add(m.id)
+    assert_equal(len(ids), len(r.mutants))
+    assert_true("pkg.m.f.1" in ids and "pkg.m.f.2" in ids, String(len(ids)))
 
 
 def main() raises:

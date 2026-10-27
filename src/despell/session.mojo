@@ -449,9 +449,9 @@ def run_mutants(
             _save(r, config, before, current, snap, done)
             last_save = monotonic_ns()
             var took = last_save - now
-            # don't let saving crowd out testing
-            save_gap = max(10_000_000_000, 10 * took)
-            if took > 2_000_000_000:
+            # don't let saving crowd out testing: nothing runs meanwhile
+            save_gap = max(10_000_000_000, 30 * took)
+            if took > 5_000_000_000:
                 log("  saving results took " + format_seconds(Float64(took) / 1e9) + "s")
     _write_timings(r, timings)
     var elapsed = seconds_since(t0)

@@ -479,6 +479,9 @@ struct Run(Movable):
             var first_mutant = number
             var first_fid = fid
             var module = module_name(sp.module_rel)
+            # overloads share a name, so their mutants are numbered on from
+            # the ones before
+            var taken = Dict[String, Int]()
             for f in functions:
                 # a statement is known by its first mutant's number
                 var site_of = List[Int]()
@@ -487,15 +490,18 @@ struct Run(Movable):
                     for _ in range(len(site.mutations)):
                         site_of.append(key if site.hook else -1)
                 var index = 1
+                var before = taken.get(f.qualname, 0)
                 for m in f.mutations():
                     var desc = m.describe()
                     self.mutants.append(MutantRecord(
-                        module + "." + f.qualname + "." + String(index), number, fid, sp.rel, m.line + 1, m.col + 1,
+                        module + "." + f.qualname + "." + String(before + index), number, fid, sp.rel, m.line + 1,
+                        m.col + 1,
                         m.end_col + 1, f.qualname, desc, m.original, m.replacement,
                         _fingerprint(line_list, f, desc, m.line), site_of[index - 1],
                     ))
                     number += 1
                     index += 1
+                taken[f.qualname] = before + index - 1
                 fid += 1
             self.files.append(
                 SourceFile(sp.rel, module, source, functions^, first_fid, first_mutant, number - first_mutant, _package_of(sp.module_rel))
