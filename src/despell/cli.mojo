@@ -75,7 +75,7 @@ the line, or on the `def` line for a whole function.
 Configuration, in despell.toml or [tool.despell] in pixi.toml/pyproject.toml:
   paths_to_mutate = ["src"]   tests_dir = "tests"   include_dirs = ["src"]
   also_copy = []  do_not_mutate = []  build_args = []  mojo = "mojo"
-  timeout_multiplier = 10.0  timeout_floor = 2.0
+  timeout_multiplier = 10.0  timeout_floor = 2.0  sandbox_tests = true
 Tests run in a copy of the project in mutants/ (also_copy lists extra files
 they need). Results are stored in mutants/despell.json.
 """
@@ -86,7 +86,7 @@ comptime USAGE = """usage: despell <command> [options]
 Mutation testing for Mojo. Run `despell guide` for the workflow.
 
 commands:
-  run [selector ...] [-j N] [--force]       generate mutants and test them
+  run [selector ...] [-j N] [--force]       generate mutants and test them (N workers; default: adapts to CPU use)
   results [selector ...] [--all] [--status s,s] [--json]
                                             list mutants from the last run (default: the ones to act on)
   show <selector> ... [--json]              show diff, location and covering tests for mutants
@@ -198,7 +198,8 @@ def cmd_run(args: List[String]) raises -> Int:
         selectors.append(args[i])
         i += 1
     var config = load_config(_root())
-    var mutants = run(config, selectors, workers if workers > 0 else _default_workers(), force)
+    # without -j, the number of workers adapts to the CPU the tests use
+    var mutants = run(config, selectors, workers if workers > 0 else _default_workers(), force, workers == 0)
     print()
     _report(mutants)
     return 0

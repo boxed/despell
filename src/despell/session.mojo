@@ -11,7 +11,10 @@ from .state import (
     StateLock, TestRecord, is_actionable, matches, merge_result, plan, read_state, snapshot_id, test_file_hashes,
     write_state,
 )
-from .sysutil import Finished, getpid, lock_file, monotonic_ns, seconds_since, unlock_file, with_env
+from .sysutil import (
+    Finished, children_cpu_seconds, getpid, load_average, lock_file, memory_available, monotonic_ns, seconds_since,
+    unlock_file, with_env,
+)
 from .textutil import first_failed_test, format_seconds, numbers_after
 
 comptime STATS_MODE = "-1"
@@ -19,19 +22,43 @@ comptime STATS_MODE = "-1"
 # coverage are first built without mutants to measure it: then each binary
 # only gets the mutants its tests reach. DESPELL_COVERAGE_FIRST overrides it.
 comptime COVERAGE_FIRST = 1000
+# The share of the machine's memory under which fewer mutants run at once
+comptime LOW_MEMORY = 0.2
 
 
 # ---- phase 3: coverage ---------------------------------------------------------
 
 
 def _test_argv(r: Run, file: String, names: List[String]) -> List[String]:
-    var argv = List[String]()
+    var argv = r.test_prefix.copy()
     argv.append(r.binary_for(file))
     if len(names) > 0:
         argv.append("--only")
         for n in names:
             argv.append(n)
     return argv^
+
+
+def _without_coverage(output: String) -> String:
+    """A test's output without the coverage lines despell's hooks print, and
+    without the tests `--only` skipped."""
+    var out = String("")
+    for line in output.splitlines():
+        if not (line.startswith("despell-hit ") or line.startswith("despell-site ") or line.strip().startswith("SKIP [")):
+            out += line + "\n"
+    return String(out.strip())
+
+
+def _pass_unsandboxed(r: Run, commands: List[Command], failing: List[Int]) raises -> Bool:
+    """Whether the `failing` commands pass without the sandbox."""
+    var again = List[Command]()
+    for k in failing:
+        ref c = commands[k]
+        again.append(Command(List[String](c.argv[len(r.test_prefix) :]), c.cwd, c.env.copy(), c.timeout))
+    for res in run_parallel(again, r.workers):
+        if res.code != 0:
+            return False
+    return True
 
 
 def collect_stats(mut r: Run, only_files: Set[String] = Set[String]()) raises:
@@ -58,6 +85,7 @@ def collect_stats(mut r: Run, only_files: Set[String] = Set[String]()) raises:
         ref t = r.tests[indices[k]]
         t.binary = String(r.binary_for(t.file)[byte = r.mdir.byte_length() + 1 :])
         t.duration = results[k].seconds
+        t.memory = results[k].memory
         t.functions = numbers_after(results[k].output, "despell-hit ")
         t.sites = numbers_after(results[k].output, "despell-site ")
         t.complete = True
@@ -68,7 +96,15 @@ def collect_stats(mut r: Run, only_files: Set[String] = Set[String]()) raises:
     if len(failing) > 0:
         var msg = String(len(failing)) + " tests fail without any mutation applied:\n"
         for k in range(min(5, len(failing))):
-            msg += "\n--- " + r.tests[indices[failing[k]]].id + "\n" + String(results[failing[k]].output.strip()) + "\n"
+            msg += "\n--- " + r.tests[indices[failing[k]]].id + "\n" + _without_coverage(results[failing[k]].output) + "\n"
+        if len(r.test_prefix) > 0 and _pass_unsandboxed(r, commands, failing):
+            msg += (
+                "\nThey pass outside the sandbox despell runs tests in, which keeps them from signaling processes "
+                + "they didn't start (a mutant can turn stopping a child into `kill(-1, SIGTERM)`, which takes down "
+                + "every program you have open). Tests that check whether another process is alive with "
+                + "`kill(pid, 0)` get EPERM for it there: only ESRCH means it's gone. Fix the tests, or turn the "
+                + "sandbox off with `sandbox_tests = false` in the config."
+            )
         raise Error(msg)
     log("ran " + String(len(indices)) + " tests on unmutated code (" + format_seconds(seconds_since(t0)) + "s)")
     if len(r.mutants) > 0 and not reached:
@@ -83,6 +119,7 @@ struct _Batch(Copyable, Movable):
     var file: String
     var names: List[String]
     var budget: Float64
+    var memory: Int  # the most its tests use unmutated (0: not known)
 
 
 @fieldwise_init
@@ -99,20 +136,27 @@ def _by_duration(a: TestRecord, b: TestRecord) -> Bool:
     return a.duration < b.duration
 
 
-def _batches(tests: List[TestRecord]) -> List[_Batch]:
+def _batches(r: Run, indices: List[Int]) -> List[_Batch]:
     """One failing test is enough, but a TestSuite runs all the tests it's
     given. Most mutants that get killed fail the first test they meet, so the
     fastest test runs on its own, then the rest in batches that double in
     size: a killed mutant stops early, and a survivor only pays for a few
     more process starts (milliseconds each)."""
-    var sorted_tests = tests.copy()
+    var sorted_tests = List[TestRecord]()
+    for i in indices:
+        ref t = r.tests[i]
+        # without the coverage lists, which can be long
+        var copy = TestRecord(t.id, t.file, t.name)
+        copy.duration = t.duration
+        copy.memory = t.memory
+        sorted_tests.append(copy^)
     sort(Span(sorted_tests), _by_duration)
     var batches = List[_Batch]()
     ref first = sorted_tests[0]
     var first_names = List[String]()
     if first.name.byte_length():
         first_names.append(first.name)
-    batches.append(_Batch(first.file, first_names^, first.duration))
+    batches.append(_Batch(first.file, first_names^, first.duration, first.memory))
     # the rest per binary, the cheapest binary first
     var files = List[String]()
     var totals = List[Float64]()
@@ -141,6 +185,7 @@ def _batches(tests: List[TestRecord]) -> List[_Batch]:
         var count = 0
         var names = List[String]()
         var budget: Float64 = 0
+        var memory = 0
         for i in range(1, len(sorted_tests)):
             ref t = sorted_tests[i]
             if t.file != files[j]:
@@ -148,46 +193,141 @@ def _batches(tests: List[TestRecord]) -> List[_Batch]:
             if t.name.byte_length():
                 names.append(t.name)
             budget += t.duration
+            memory = max(memory, t.memory)
             count += 1
             if count == size:
-                batches.append(_Batch(files[j], names^, budget))
+                batches.append(_Batch(files[j], names^, budget, memory))
                 names = List[String]()
                 budget = 0
+                memory = 0
                 count = 0
                 size *= 2
         if count > 0:
-            batches.append(_Batch(files[j], names^, budget))
+            batches.append(_Batch(files[j], names^, budget, memory))
     return batches^
 
 
-def _tests_for(r: Run, m: MutantRecord, by_fid: Dict[Int, List[Int]], by_site: Dict[Int, List[Int]]) -> List[TestRecord]:
-    """The tests that run the mutant's statement (only they can kill it),
-    within the test files it's allowed."""
+def _tests_for(r: Run, m: MutantRecord, by_fid: Dict[Int, List[Int]], by_site: Dict[Int, List[Int]]) -> List[Int]:
+    """The tests (indices into `r.tests`) that run the mutant's statement
+    (only they can kill it), within the test files it's allowed."""
     var indices = by_site.get(m.site, List[Int]()) if m.site >= 0 else by_fid.get(m.fid, List[Int]())
     var restricted = m.number in r.allowed
     var allowed = r.allowed.get(m.number, Set[String]())
-    var tests = List[TestRecord]()
+    var tests = List[Int]()
     for i in indices:
         # coverage can vary between runs (timing): only binaries holding the
         # mutant can test it
         if (not restricted or r.tests[i].file in allowed) and r.holds(r.tests[i].file, m.number):
-            tests.append(r.tests[i].copy())
+            tests.append(i)
     return tests^
+
+
+def _slow_tests(r: Run, todo: List[Int], by_fid: Dict[Int, List[Int]], by_site: Dict[Int, List[Int]]):
+    """Point out tests that take a large share of the mutant run: every
+    survivor runs every test that reaches it, so one slow test reaching much
+    of the code can dominate it, and making it faster pays off in every run."""
+    var reached = List[Int](length=len(r.tests), fill=0)
+    for n in todo:
+        for i in _tests_for(r, r.mutants[n - 1], by_fid, by_site):
+            reached[i] += 1
+    var total: Float64 = 0
+    for i in range(len(r.tests)):
+        total += r.tests[i].duration * Float64(reached[i])
+    if total < 600:  # worker-seconds: a short run either way
+        return
+    for _ in range(3):
+        var best = -1
+        var best_cost: Float64 = 0
+        for i in range(len(r.tests)):
+            var cost = r.tests[i].duration * Float64(reached[i])
+            if cost > best_cost:
+                best = i
+                best_cost = cost
+        if best < 0 or best_cost < total * 0.1:
+            return
+        ref t = r.tests[best]
+        log(
+            "slow test: " + t.id + " takes " + format_seconds(t.duration) + "s and reaches " + String(reached[best])
+            + " of these mutants, up to " + String(Int(100 * best_cost / total + 0.5))
+            + "% of the time running them takes; making it faster speeds up every run"
+        )
+        reached[best] = 0
+
+
+struct _Scaler(Movable):
+    """Without `-j`, the number of workers follows how much CPU the tests
+    use: tests that mostly wait (on I/O, the network, their own timeouts)
+    leave cores idle that more workers can use, as long as there's memory to
+    spare. Not fewer than to start with, unless memory runs low."""
+
+    var on: Bool
+    var cores: Int
+    var low: Int
+    var high: Int
+    var t_ns: Int
+    var cpu: Float64
+    var busy: Float64  # cores the tests keep busy, smoothed
+
+    def __init__(out self, on: Bool, workers: Int):
+        from std.sys.info import num_physical_cores
+
+        self.on = on
+        self.cores = num_physical_cores()
+        self.low = workers
+        self.high = max(workers, 4 * self.cores)
+        self.t_ns = monotonic_ns()
+        self.cpu = children_cpu_seconds()
+        self.busy = -1
+
+    def adjust(mut self, workers: Int) -> Int:
+        """How many workers to have now (looked at every few seconds)."""
+        var now = monotonic_ns()
+        if not self.on or now - self.t_ns < 5_000_000_000:
+            return workers
+        var memory = memory_available()
+        if memory < LOW_MEMORY:
+            self.t_ns = now
+            self.cpu = children_cpu_seconds()
+            return max(1, workers - max(1, workers // 4))
+        # finished children only, so a long test counts all at once: smooth
+        var cpu = children_cpu_seconds()
+        var busy = (cpu - self.cpu) / (Float64(now - self.t_ns) / 1e9)
+        self.busy = busy if self.busy < 0 else (self.busy + busy) / 2
+        self.t_ns = now
+        self.cpu = cpu
+        var target = 0.8 * Float64(self.cores)
+        var load = load_average()
+        if self.busy > target or load > 1.5 * Float64(self.cores):
+            return max(self.low, workers - max(1, workers // 8))
+        if self.busy < 0.6 * target and load < Float64(self.cores) and memory > 2 * LOW_MEMORY:
+            return min(self.high, workers + max(1, workers // 4))
+        return workers
+
+
+def _memory_limit(b: _Batch) -> Int:
+    """What a mutant's tests may use before they're stopped: a mutant can make
+    them allocate without end, which takes the machine down before a timeout."""
+    comptime GB = 1024 * 1024 * 1024
+    if b.memory == 0:
+        return 4 * GB
+    return max(4 * b.memory, b.memory + GB)
 
 
 def _start(mut r: Run, mut job: _Job) raises:
     ref b = job.batches[job.next]
     var timeout = max(r.config.timeout_floor, b.budget * r.config.timeout_multiplier)
     var env = with_env(r.mojo.env, ["DESPELL_MUTANT=" + String(job.number)])
-    r._pool.start(job.number, _test_argv(r, b.file, b.names), r.mdir, env, timeout)
+    r._pool.start(job.number, _test_argv(r, b.file, b.names), r.mdir, env, timeout, _memory_limit(b))
     job.processes += 1
     job.tests += max(1, len(b.names))
 
 
 def run_mutants(
-    mut r: Run, selected: List[Int], config: Config, before: State, current: Dict[String, String], snap: String
+    mut r: Run, selected: List[Int], config: Config, before: State, current: Dict[String, String], snap: String,
+    adaptive: Bool = False,
 ) raises:
-    """Run the selected mutants (by number), saving now and then."""
+    """Run the selected mutants (by number), saving now and then. With
+    `adaptive`, `r.workers` is where to start (see `_Scaler`)."""
     var by_fid = Dict[Int, List[Int]]()
     var by_site = Dict[Int, List[Int]]()
     for i in range(len(r.tests)):
@@ -206,7 +346,12 @@ def run_mutants(
             todo.append(n)
     if len(todo) == 0:
         return
-    log("running " + String(len(todo)) + " mutants with " + String(r.workers) + " workers")
+    _slow_tests(r, todo, by_fid, by_site)
+    var scaler = _Scaler(adaptive, r.workers)
+    log(
+        "running " + String(len(todo)) + " mutants with " + String(r.workers) + " workers"
+        + (", more while the tests leave cores idle" if adaptive else "")
+    )
     var t0 = monotonic_ns()
     var last_report = t0
     var last_save = t0
@@ -218,7 +363,10 @@ def run_mutants(
 
     while next < len(todo) or len(r._pool) > 0:
         # keep the workers busy
-        while next < len(todo) and len(r._pool) < r.workers:
+        r.workers = scaler.adjust(r.workers)
+        # with memory low, nothing new until something finishes
+        var room = len(r._pool) == 0 or memory_available() >= LOW_MEMORY / 2
+        while room and next < len(todo) and len(r._pool) < r.workers:
             var n = todo[next]
             next += 1
             var tests = _tests_for(r, r.mutants[n - 1], by_fid, by_site)
@@ -232,7 +380,7 @@ def run_mutants(
                 done.add(r.mutants[n - 1].id)
                 _report(r.mutants[n - 1])
                 continue
-            var job = _Job(n, _batches(tests), 0, monotonic_ns(), 0, 0)
+            var job = _Job(n, _batches(r, tests), 0, monotonic_ns(), 0, 0)
             _start(r, job)
             jobs[n] = job^
         if len(r._pool) == 0:
@@ -251,7 +399,14 @@ def run_mutants(
         var file = job.batches[job.next].file
         var timeout = max(r.config.timeout_floor, job.batches[job.next].budget * r.config.timeout_multiplier)
         var finished = True
-        if f.timed_out:
+        if f.over_memory:
+            r.mutants[n - 1].status = KILLED
+            r.mutants[n - 1].killed_by = file
+            r.mutants[n - 1].detail = (
+                "stopped after using " + _megabytes(f.memory) + " of memory (unmutated, its tests use "
+                + _megabytes(job.batches[job.next].memory) + ")"
+            )
+        elif f.timed_out:
             r.mutants[n - 1].status = TIMEOUT
             r.mutants[n - 1].killed_by = file
             r.mutants[n - 1].detail = "no result after " + format_seconds(timeout) + "s"
@@ -278,7 +433,10 @@ def run_mutants(
             _report(r.mutants[n - 1])
         var now = monotonic_ns()
         if now - last_report > 10_000_000_000 and len(done) < len(todo):
-            log("  " + String(len(done)) + "/" + String(len(todo)) + " mutants done")
+            log(
+                "  " + String(len(done)) + "/" + String(len(todo)) + " mutants done"
+                + (" (" + String(r.workers) + " workers)" if adaptive else "")
+            )
             last_report = now
         if now - last_save > save_gap:
             _save(r, config, before, current, snap, done)
@@ -291,6 +449,10 @@ def run_mutants(
     _write_timings(r, timings)
     var elapsed = seconds_since(t0)
     log("ran " + String(len(todo)) + " mutants (" + format_seconds(elapsed) + "s, " + String(Int(Float64(len(todo)) / max(elapsed, 1e-9) + 0.5)) + "/s)")
+
+
+def _megabytes(n: Int) -> String:
+    return String(n // (1024 * 1024)) + " MB"
 
 
 def _report(m: MutantRecord):
@@ -391,10 +553,11 @@ def _reached(r: Run, tests: List[TestRecord]) -> Set[Int]:
 def _coverage(
     mut r: Run, old_tests: Dict[String, TestRecord], snapshots: Dict[String, Dict[String, String]],
     current: Dict[String, String],
-) raises:
+) raises -> Set[String]:
     """Learn what each test file to build reaches: from the last run where
     that still holds, else, for a big build, by building it without mutants
-    first. Then each binary only needs the mutants its tests reach."""
+    first. Then each binary only needs the mutants its tests reach. Returns
+    the test files whose tests ran here."""
     var by_file = Dict[String, List[String]]()
     for item in old_tests.items():
         var l = by_file.get(item.value.file, List[String]())
@@ -415,15 +578,16 @@ def _coverage(
     if override.byte_length():
         threshold = Int(atol(override))
     if len(stale) == 0 or len(r.enabled) < threshold:
-        return
+        return Set[String]()
     var t0 = monotonic_ns()
+    log("measuring coverage first: building " + String(len(stale)) + " test files without mutants")
     try:
         r.coverage_build(stale)
     except e:
         if String(e) == "interrupted":
             raise e^
         log("building without mutants to measure coverage failed, so every binary gets every mutant: " + String(e))
-        return
+        return Set[String]()
     var stale_set = Set[String]()
     for f in stale:
         stale_set.add(f)
@@ -434,10 +598,8 @@ def _coverage(
             if t.file == f:
                 tests.append(t.copy())
         r.file_sets[f] = _reached(r, tests)
-    log(
-        "measured coverage first, building " + String(len(stale)) + " test files without mutants ("
-        + format_seconds(seconds_since(t0)) + "s)"
-    )
+    log("measured coverage (" + format_seconds(seconds_since(t0)) + "s)")
+    return stale_set^
 
 
 def _files_to_build(
@@ -488,10 +650,13 @@ def _files_to_build(
     return needed^
 
 
-def run(config: Config, selectors: List[String], workers: Int, force: Bool = False) raises -> List[MutantRecord]:
+def run(
+    config: Config, selectors: List[String], workers: Int, force: Bool = False, adaptive: Bool = False
+) raises -> List[MutantRecord]:
     """Run the selected mutants, or, without selectors, every mutant without
     an up-to-date result (with `force`, whatever their results). Returns the
-    selected mutants, or all of them."""
+    selected mutants, or all of them. With `adaptive`, the number of workers
+    running mutants follows the CPU the tests use, starting at `workers`."""
     # mutants/ itself, or a private copy beside it if another run has it
     mkdirs(config.mutants_dir())
     var main_lock = lock_file(join(config.mutants_dir(), MAIN_LOCK), False)
@@ -500,7 +665,7 @@ def run(config: Config, selectors: List[String], workers: Int, force: Bool = Fal
         tree = join(join(config.mutants_dir(), SIDE_DIR), String(getpid()))
         log("another despell run is using mutants/; this one works in mutants/" + String(SIDE_DIR) + "/" + String(getpid()))
     try:
-        var result = _run(config, selectors, workers, tree, force)
+        var result = _run(config, selectors, workers, tree, force, adaptive)
         _release(main_lock, tree, config)
         return result^
     except e:
@@ -515,13 +680,16 @@ def _release(lock: Int, tree: String, config: Config):
         rmtree(tree)
 
 
-def _run(config: Config, selectors: List[String], workers: Int, tree: String, force: Bool) raises -> List[MutantRecord]:
+def _run(
+    config: Config, selectors: List[String], workers: Int, tree: String, force: Bool, adaptive: Bool
+) raises -> List[MutantRecord]:
     var t0 = monotonic_ns()
     var lock = StateLock(config)
     var before = read_state(config)
     lock.release()
     var r = Run(config, workers, tree)
     r.prepare()
+    r.contain_tests()
     var all_tests = discover_tests(config)
     if len(all_tests) == 0:
         raise Error("no test files found in " + config.tests_dir)
@@ -551,6 +719,7 @@ def _run(config: Config, selectors: List[String], workers: Int, tree: String, fo
             m.killed_by = o.killed_by
             m.detail = o.detail
             m.tested_with = o.tested_with
+            m.compiles = o.compiles
         plans[m.number] = plan(m, old, before.snapshots, current)
     var chosen = List[Int]()
     for m in r.mutants:
@@ -598,15 +767,22 @@ def _run(config: Config, selectors: List[String], workers: Int, tree: String, fo
     else:
         r.tests = all_tests^
     r.begin_build(before.mutants, only)
-    _coverage(r, before.tests, before.snapshots, current)
+    var measured = _coverage(r, before.tests, before.snapshots, current)
     r.finish_build(before.mutants)
     # a long build's verdicts survive whatever goes wrong after it
     _ = _save(r, config, before, current, snap, Set[String]())
-    collect_stats(r)
+    # the binaries with mutants run the same code when none is active, so
+    # what was just measured holds
+    var unmeasured = Set[String]()
+    for f in r.test_files():
+        if not (f in measured):
+            unmeasured.add(f)
+    if len(unmeasured) > 0:
+        collect_stats(r, unmeasured)
     for i in range(len(r.tests)):
         r.tests[i].snapshot = snap
     r.stats_done = True
-    run_mutants(r, selected, config, before, current, snap)
+    run_mutants(r, selected, config, before, current, snap, adaptive)
     var fresh = Set[String]()
     for n in selected:
         fresh.add(r.mutants[n - 1].id)

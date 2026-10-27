@@ -131,6 +131,70 @@ def seconds_since(start_ns: Int) -> Float64:
     return Float64(monotonic_ns() - start_ns) / 1e9
 
 
+def children_cpu_seconds() -> Float64:
+    """CPU time (user and system) used by the child processes waited for so far."""
+    var buf = alloc_zero(256)  # struct rusage
+    _ = external_call["getrusage", Int32](Int32(-1), buf.unsafe_ptr())  # RUSAGE_CHILDREN
+    var p = buf.unsafe_ptr().unsafe_bitcast[Int]()
+    # two struct timevals: seconds, then microseconds (32 bits on macOS)
+    var user = Float64(p[unsafe_offset=0]) + Float64(p[unsafe_offset=1] & 0xFFFFFFFF) / 1e6
+    var system = Float64(p[unsafe_offset=2]) + Float64(p[unsafe_offset=3] & 0xFFFFFFFF) / 1e6
+    return user + system
+
+
+def load_average() -> Float64:
+    """The 1-minute load average (0 if unknown)."""
+    var buf = alloc_zero(8)
+    if external_call["getloadavg", Int32](buf.unsafe_ptr(), Int32(1)) != 1:
+        return 0
+    return buf.unsafe_ptr().unsafe_bitcast[Float64]()[unsafe_offset=0]
+
+
+def memory_available() -> Float64:
+    """The share of the machine's memory that's available (1 if unknown)."""
+    comptime if CompilationTarget.is_macos():
+        # what macOS goes by when it starts killing processes for memory
+        var level = alloc_zero(4)
+        var size = alloc_zero(8)
+        size.unsafe_ptr().unsafe_bitcast[Int]()[unsafe_offset=0] = 4
+        var name = c_string("kern.memorystatus_level")
+        if external_call["sysctlbyname", Int32](name.unsafe_ptr(), level.unsafe_ptr(), size.unsafe_ptr(), 0, 0) != 0:
+            return 1
+        return Float64(level.unsafe_ptr().unsafe_bitcast[Int32]()[unsafe_offset=0]) / 100
+    else:
+        try:
+            var total = 0
+            var available = -1
+            with open("/proc/meminfo", "r") as f:
+                for line in f.read().splitlines():
+                    var parts = String(line).split()
+                    if len(parts) >= 2 and parts[0] == "MemTotal:":
+                        total = Int(atol(parts[1]))
+                    elif len(parts) >= 2 and parts[0] == "MemAvailable:":
+                        available = Int(atol(parts[1]))
+            if total <= 0 or available < 0:
+                return 1
+            return Float64(available) / Float64(total)
+        except:
+            return 1
+
+
+def process_memory(pid: Int32) -> Int:
+    """The memory a running process uses, in bytes (0 if unknown)."""
+    comptime if CompilationTarget.is_macos():
+        var info = alloc_zero(256)  # struct rusage_info_v0
+        if external_call["proc_pid_rusage", Int32](pid, Int32(0), info.unsafe_ptr()) != 0:
+            return 0
+        return info.unsafe_ptr().unsafe_bitcast[Int]()[unsafe_offset=9]  # ri_phys_footprint
+    else:
+        try:
+            with open("/proc/" + String(pid) + "/statm", "r") as f:
+                var parts = f.read().split()
+                return Int(atol(parts[1])) * Int(external_call["getpagesize", Int32]())
+        except:
+            return 0
+
+
 def getpid() -> Int:
     return Int(external_call["getpid", Int32]())
 
@@ -252,6 +316,9 @@ struct Finished(Movable):
     var timed_out: Bool
     var output: String
     var seconds: Float64
+    var memory: Int  # peak, in bytes (0 if unknown)
+    # killed for using more memory than its `memory_limit`
+    var over_memory: Bool
 
 
 struct _Child(Movable):
@@ -261,14 +328,18 @@ struct _Child(Movable):
     var output: List[UInt8]
     var start_ns: Int
     var deadline_ns: Int  # 0: none
+    var memory_limit: Int  # bytes, 0: none
+    var memory: Int  # the most seen while checking the limit
 
-    def __init__(out self, pid: Int32, fd: Int32, tag: Int, start_ns: Int, deadline_ns: Int):
+    def __init__(out self, pid: Int32, fd: Int32, tag: Int, start_ns: Int, deadline_ns: Int, memory_limit: Int):
         self.pid = pid
         self.fd = fd
         self.tag = tag
         self.output = List[UInt8]()
         self.start_ns = start_ns
         self.deadline_ns = deadline_ns
+        self.memory_limit = memory_limit
+        self.memory = 0
 
 
 def _set_pollfd(mut buf: List[UInt8], i: Int, fd: Int32):
@@ -287,23 +358,30 @@ def _exit_code(status: Int32) -> Int:
     return (s >> 8) & 0xFF
 
 
+# a child's output beyond this is dropped (a mutant can print in a loop)
+comptime _MAX_OUTPUT = 32 * 1024 * 1024
+
+
 struct ProcessPool(Movable, Sized):
     """Children running at once; `wait_any` returns them as they finish."""
 
     var children: List[_Child]
+    var _memory_checked_ns: Int
 
     def __init__(out self):
         self.children = List[_Child]()
+        self._memory_checked_ns = 0
 
     def __len__(self) -> Int:
         return len(self.children)
 
     def start(
-        mut self, tag: Int, argv: List[String], cwd: String, env: List[String], timeout: Float64 = 0
+        mut self, tag: Int, argv: List[String], cwd: String, env: List[String], timeout: Float64 = 0,
+        memory_limit: Int = 0,
     ) raises:
         """Start `argv` in `cwd` with environment `env`; `timeout` in seconds
-        (0: none). The child gets its own process group, so a timeout kills
-        whatever it started too."""
+        (0: none), `memory_limit` in bytes (0: none). The child gets its own
+        process group, so a timeout kills whatever it started too."""
         var fds = alloc_zero(8)
         if external_call["pipe", Int32](fds.unsafe_ptr()) != 0:
             raise Error("pipe() failed")
@@ -360,7 +438,7 @@ struct ProcessPool(Movable, Sized):
         var pid = pid_buf.unsafe_ptr().unsafe_bitcast[Int32]()[unsafe_offset=0]
         var now = monotonic_ns()
         var deadline = now + Int(timeout * 1e9) if timeout > 0 else 0
-        self.children.append(_Child(pid, read_fd, tag, now, deadline))
+        self.children.append(_Child(pid, read_fd, tag, now, deadline, memory_limit))
 
     def wait_any(mut self) raises -> Finished:
         """Wait for one child to finish, and return it."""
@@ -371,22 +449,38 @@ struct ProcessPool(Movable, Sized):
                 self.kill_all()
                 raise Error("interrupted")
             var now = monotonic_ns()
+            # a mutant can make a test allocate without end, which takes the
+            # whole machine down long before a timeout
+            var check_memory = now - self._memory_checked_ns > 100_000_000
+            if check_memory:
+                self._memory_checked_ns = now
             for i in range(len(self.children)):
                 var pid = self.children[i].pid
                 var deadline = self.children[i].deadline_ns
                 if deadline != 0 and now > deadline:
-                    _ = external_call["kill", Int32](-pid, _SIGKILL)
-                    _ = external_call["kill", Int32](pid, _SIGKILL)
-                    var status = alloc_zero(4)
-                    _ = external_call["waitpid", Int32](pid, status.unsafe_ptr(), Int32(0))
+                    self._kill(i)
                     return self._finish(i, 0, True)
+                if check_memory and self.children[i].memory_limit > 0:
+                    var used = process_memory(pid)
+                    self.children[i].memory = max(self.children[i].memory, used)
+                    if used > self.children[i].memory_limit:
+                        self._kill(i)
+                        var f = self._finish(i, 0, False)
+                        f.over_memory = True
+                        return f^
                 var status = alloc_zero(4)
-                var rc = external_call["waitpid", Int32](pid, status.unsafe_ptr(), _WNOHANG)
+                var usage = alloc_zero(256)  # struct rusage
+                var rc = external_call["wait4", Int32](pid, status.unsafe_ptr(), _WNOHANG, usage.unsafe_ptr())
                 if rc == pid:
                     # exited: take what's left in the pipe (a grandchild may
                     # hold it open, so don't wait for EOF)
                     self._drain(i)
                     var code = _exit_code(status.unsafe_ptr().unsafe_bitcast[Int32]()[unsafe_offset=0])
+                    # ru_maxrss, after two struct timevals: bytes on macOS, KiB on Linux
+                    var peak = usage.unsafe_ptr().unsafe_bitcast[Int]()[unsafe_offset=4]
+                    comptime if not CompilationTarget.is_macos():
+                        peak *= 1024
+                    self.children[i].memory = max(self.children[i].memory, peak)
                     return self._finish(i, code, False)
             # wait for output, a timeout or (polled) an exit
             var n = len(self.children)
@@ -405,6 +499,14 @@ struct ProcessPool(Movable, Sized):
                         self._read_some(i)
             else:
                 _ = external_call["usleep", Int32](UInt32(wait_ms * 1000))
+
+    def _kill(mut self, i: Int):
+        """Kill child `i` (and what it started), and reap it."""
+        var pid = self.children[i].pid
+        _ = external_call["kill", Int32](-pid, _SIGKILL)
+        _ = external_call["kill", Int32](pid, _SIGKILL)
+        var status = alloc_zero(4)
+        _ = external_call["waitpid", Int32](pid, status.unsafe_ptr(), Int32(0))
 
     def kill_all(mut self):
         """Kill every child (and what it started), and reap them."""
@@ -432,7 +534,8 @@ struct ProcessPool(Movable, Sized):
                 _ = external_call["close", Int32](fd)
                 self.children[i].fd = -1
                 return
-            for k in range(got):
+            var room = _MAX_OUTPUT - len(self.children[i].output)
+            for k in range(min(got, room)):
                 self.children[i].output.append(buf[k])
 
     def _drain(mut self, i: Int):
@@ -447,7 +550,9 @@ struct ProcessPool(Movable, Sized):
             _ = external_call["close", Int32](self.children[i].fd)
             self.children[i].fd = -1
         var child = self.children.pop(i)
-        return Finished(child.tag, code, timed_out, string_from_bytes(child.output), seconds_since(child.start_ns))
+        return Finished(
+            child.tag, code, timed_out, string_from_bytes(child.output), seconds_since(child.start_ns), child.memory, False
+        )
 
 
 def run_command(argv: List[String], cwd: String, env: List[String], timeout: Float64 = 0) raises -> Finished:

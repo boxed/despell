@@ -11,6 +11,7 @@ Phases:
 
 from std.collections import Dict, Set
 from std.os.path import isdir
+from std.sys.info import CompilationTarget
 
 from .fsutil import (
     copy_file, copy_tree, hash_bytes, hash_text, read_bytes, is_dir, is_file, join, list_dir, mkdirs, parent, path_exists, read_text,
@@ -317,6 +318,13 @@ struct _Frame(Copyable, Movable):
     var message: String
 
 
+# Lets a test signal only what's in its sandbox and its process group, which
+# despell gives each test process (a macOS sandbox profile)
+comptime SIGNAL_SANDBOX = (
+    "(version 1)(allow default)(deny signal)(allow signal (target same-sandbox))(allow signal (target pgrp))"
+)
+
+
 struct Run(Movable):
     var config: Config
     var workers: Int
@@ -344,6 +352,8 @@ struct Run(Movable):
     var build_t0: Int
     var _generator: String  # a hash of despell itself
     var _pool: ProcessPool  # the test processes of the mutants running
+    # what test commands run under (see `contain_tests`)
+    var test_prefix: List[String]
 
     def __init__(out self, config: Config, workers: Int, tree: String):
         self.config = config.copy()
@@ -366,11 +376,35 @@ struct Run(Movable):
         self.build_t0 = 0
         self._generator = String("")
         self._pool = ProcessPool()
+        self.test_prefix = List[String]()
 
     def mutant(mut self, n: Int) -> ref[self.mutants] MutantRecord:
         return self.mutants[n - 1]
 
     # ---- phase 1: generation -------------------------------------------------
+
+    def contain_tests(mut self):
+        """Keep the tests from signaling processes they didn't start. Code
+        that stops its child processes is one mutant away from `kill(-1,
+        SIGTERM)`, which on a desktop takes down every program the user has
+        open (despell included)."""
+        if not self.config.sandbox_tests:
+            return
+        comptime if CompilationTarget.is_macos():
+            var prefix = List[String]()
+            for a in ["/usr/bin/sandbox-exec", "-p", SIGNAL_SANDBOX]:
+                prefix.append(String(a))
+            try:
+                var probe = prefix.copy()
+                probe.append("/usr/bin/true")
+                if run_command(probe, self.mdir, environment(), 30).code == 0:
+                    self.test_prefix = prefix^
+                    return
+            except:
+                pass
+            log("warning: can't sandbox the tests (sandbox-exec failed), so a mutant could signal any of your processes")
+        else:
+            log("warning: tests aren't sandboxed on this platform, so a mutant could signal any of your processes")
 
     def prepare(mut self) raises:
         ref cfg = self.config
@@ -696,13 +730,14 @@ struct Run(Movable):
         for n in enabled:
             ref m = self.mutants[n - 1]
             var old = previous.get(m.id)
-            if not (old and old.value().fingerprint == m.fingerprint and is_final(old.value().status)):
+            if not (old and old.value().fingerprint == m.fingerprint and (old.value().compiles or is_final(old.value().status))):
                 unknown.add(n)
         var t_pre0 = monotonic_ns()
         self.precheck(unknown, disabled_functions)
         var still = Set[Int]()
         for n in enabled:
             if self.mutants[n - 1].status != COMPILE_ERROR:
+                self.mutants[n - 1].compiles = True
                 still.add(n)
         enabled = still^
         var t_pre = seconds_since(t_pre0)

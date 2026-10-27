@@ -73,6 +73,8 @@ struct MutantRecord(Copyable, Movable):
     var site: Int
     # the snapshot of the tests this result was obtained with ("": none)
     var tested_with: String
+    # passed the pre-check in a build (so a resumed run can skip it)
+    var compiles: Bool
 
     def __init__(
         out self, id: String, number: Int, fid: Int, file: String, line: Int, col: Int, end_col: Int,
@@ -96,6 +98,7 @@ struct MutantRecord(Copyable, Movable):
         self.detail = String("")
         self.site = site
         self.tested_with = String("")
+        self.compiles = False
 
     def to_json(self) -> Json:
         var j = Json.object()
@@ -116,6 +119,8 @@ struct MutantRecord(Copyable, Movable):
         j.set("detail", _opt(self.detail))
         j.set("site", Json.of(self.site) if self.site >= 0 else Json())
         j.set("tested_with", _opt(self.tested_with))
+        if self.compiles:
+            j.set("compiles", Json.of(True))
         return j^
 
     @staticmethod
@@ -130,6 +135,7 @@ struct MutantRecord(Copyable, Movable):
         m.killed_by = j.str_or("killed_by", "")
         m.detail = j.str_or("detail", "")
         m.tested_with = j.str_or("tested_with", "")
+        m.compiles = j.has("compiles") and j.get("compiles").as_bool()
         return m^
 
     def location(self) -> String:
@@ -153,6 +159,7 @@ struct TestRecord(Copyable, Movable):
     # measured with coverage hooks on every statement; else (older despell
     # versions) only the statements of the mutants in that build
     var complete: Bool
+    var memory: Int  # peak bytes, unmutated (0: not known)
 
     def __init__(out self, id: String, file: String, name: String):
         self.id = id
@@ -164,6 +171,7 @@ struct TestRecord(Copyable, Movable):
         self.sites = List[Int]()
         self.snapshot = String("")
         self.complete = False
+        self.memory = 0
 
     def to_json(self) -> Json:
         var j = Json.object()
@@ -176,6 +184,7 @@ struct TestRecord(Copyable, Movable):
         j.set("sites", Json.ints(self.sites))
         j.set("snapshot", _opt(self.snapshot))
         j.set("complete", Json.of(self.complete))
+        j.set("memory", Json.of(self.memory))
         return j^
 
     @staticmethod
@@ -183,6 +192,7 @@ struct TestRecord(Copyable, Movable):
         var t = TestRecord(j.str_or("id", ""), j.str_or("file", ""), j.str_or("name", ""))
         t.binary = j.str_or("binary", "")
         t.duration = j.float_or("duration", 0)
+        t.memory = j.int_or("memory", 0)
         t.functions = j.int_list("functions")
         t.sites = j.int_list("sites")
         t.snapshot = j.str_or("snapshot", "")
@@ -380,7 +390,9 @@ def merge_result(ours: MutantRecord, theirs: Optional[MutantRecord], seen: Optio
         return ours.copy()  # new, or the code changed
     ref t = theirs.value()
     if not ran_it:
-        return t.copy()
+        var kept = t.copy()
+        kept.compiles = t.compiles or ours.compiles
+        return kept^
     var written_since = not seen or t.status != seen.value().status or t.tested_with != seen.value().tested_with
     if written_since and (t.status == KILLED or t.status == TIMEOUT) and (ours.status == SURVIVED or ours.status == NO_TESTS):
         # another run killed it meanwhile, with other tests: a kill stands

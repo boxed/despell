@@ -5,11 +5,12 @@ the state the previous ones left.
 """
 
 from std.collections import Dict
+from std.sys.info import CompilationTarget
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
-from despell.fsutil import copy_tree, join, read_text, real_path, rmtree, write_text, remove_file
+from despell.fsutil import copy_tree, is_file, join, mkdirs, read_text, real_path, rmtree, write_text, remove_file
 from despell.jsonio import Json, encode, parse
-from despell.sysutil import Finished, environment, run_command, with_env
+from despell.sysutil import Finished, ProcessPool, environment, run_command, with_env
 
 comptime PROJECT = "tmp/e2e/simple"
 
@@ -153,12 +154,50 @@ def test_7_coverage_first() raises:
     skip.append("mutants")
     copy_tree("e2e_projects/simple", PROJECT, skip)
     var out = despell_with([String("DESPELL_COVERAGE_FIRST=0")], [String("run"), String("-j"), String("4")])
-    assert_true("measured coverage first, building 2 test files" in out, out)
+    assert_true("measuring coverage first: building 2 test files without mutants" in out, out)
     assert_expected()
     var files = parse(read_text(join(PROJECT, "mutants/.despell/bin/manifest.json"))).get("files")
     var a = len(files.get("tests/test_mathx.mojo").int_list("enabled"))
     var b = len(files.get("tests/test_tricky.mojo").int_list("enabled"))
     assert_true(a > 0 and b > 0 and a + b < 70, String(a) + " " + String(b))
+
+
+def test_8_mutants_cant_signal_other_processes() raises:
+    # stopping a child is one mutant (`and` -> `or`) away from `kill(-1)`,
+    # which signals every process the user has; SIGURG is harmless
+    comptime if not CompilationTarget.is_macos():
+        return
+    var project = "tmp/e2e/signals"
+    rmtree(project)
+    mkdirs(join(project, "src/sig"))
+    mkdirs(join(project, "tests"))
+    write_text(
+        join(project, "src/sig/stop.mojo"),
+        "from std.ffi import external_call\n\n\ndef stop(alive: Bool, pid: Int32):\n"
+        + "    if alive and pid > 0:\n        _ = external_call[\"kill\", Int32](pid, Int32(16))\n",
+    )
+    write_text(join(project, "src/sig/__init__.mojo"), "")
+    write_text(
+        join(project, "tests/test_stop.mojo"),
+        "from std.testing import TestSuite\nfrom sig.stop import stop\n\n\n"
+        + "def test_stop_without_a_process() raises:\n    stop(True, -1)\n\n\n"
+        + "def main() raises:\n    TestSuite.discover_tests[__functions_in_module()]().run(quiet=True)\n",
+    )
+    var hit = real_path(project) + "/hit.txt"
+    var pool = ProcessPool()
+    var victim = List[String]()
+    for a in ["perl", "-e", "$SIG{URG} = sub { open(my $f, '>>', '" + hit + "'); print $f 'hit'; close $f }; sleep 1 while 1"]:
+        victim.append(String(a))
+    pool.start(0, victim, project, environment(), 60)
+    var argv = List[String]()
+    argv.append(real_path("build/despell"))
+    for a in ["run", "-j", "2"]:
+        argv.append(String(a))
+    var r = run_command(argv, real_path(project), environment())
+    pool.kill_all()
+    assert_equal(r.code, 0, r.output)
+    assert_true("sig.stop.stop" in r.output, r.output)
+    assert_false(is_file(hit), "a mutant signaled a process outside the tests:\n" + r.output)
 
 
 def main() raises:

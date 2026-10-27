@@ -69,6 +69,7 @@ build_args = []          # extra `mojo build` arguments
 mojo = "mojo"            # otherwise: $DESPELL_MOJO, PATH, then the nearest pixi env
 timeout_multiplier = 10.0
 timeout_floor = 2.0
+sandbox_tests = true     # keep tests from signaling processes they didn't start
 ```
 
 Results live in `mutants/despell.json`, saved as the run goes. Each result
@@ -118,9 +119,12 @@ How a statement switches depends on what it is:
 - `comptime` code isn't mutated.
 
 The active mutant comes from `DESPELL_MUTANT`, read once into a process global
-(`_Global` from the stdlib, since Mojo has no module-level `var`). A check
-costs about 5 ns. Functions that return a value end with an `abort()`, because
-a mutated `while True` no longer tells the compiler the end is unreachable.
+(`_Global` from the stdlib, since Mojo has no module-level `var`), in one of
+the runtime's few indexed slots when that's free: a check costs about 1 ns,
+against 5 ns for a lookup by name, which made hot code (small functions called
+billions of times) run several times slower. Functions that return a value end
+with an `abort()`, because a mutated `while True` no longer tells the compiler
+the end is unreachable.
 
 **The compiler as a filter.** Many mutants don't type-check (`String - String`,
 pointer arithmetic turned into `Pointer + Pointer`). A full AST wouldn't help:
@@ -159,7 +163,25 @@ in; the others get their own.
 
 **Running mutants.** Each mutant runs only the tests that reach its statement,
 grouped per test binary, in parallel worker processes, with a timeout derived
-from the measured test durations.
+from the measured test durations. Without `-j N`, the number of workers starts
+at half the cores and follows the CPU the tests use: tests that mostly wait (on
+I/O, the network, a mutant's timeout) get more workers, until the cores are
+busy or the machine is loaded with other work.
+
+**The sandbox.** Code that stops its child processes is one mutant away from
+`kill(-1, SIGTERM)` (`if alive and pid > 0` -> `if alive or pid > 0`, with
+`pid == -1`), which signals every process the user has: on a desktop, that's
+every open program. On macOS, tests run under `sandbox-exec` with a profile
+that only lets them signal their own process group (despell gives each test
+process one) and what they start. A test suite that signals other processes
+on purpose, say a liveness check with `kill(pid, 0)` on another test process
+(which gets EPERM there, not ESRCH), fails before any mutant runs, and despell
+says why. On Linux, tests aren't sandboxed yet.
+
+**Memory.** A mutant can also make a test allocate without end. despell
+records how much memory each test uses unmutated, and stops a mutant's tests
+when they use more than 4 times that and over 1 GB more (`killed`). It also
+runs fewer mutants at once when the machine runs low on memory.
 
 ### Why exec and not fork
 

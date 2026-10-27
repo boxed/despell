@@ -11,7 +11,7 @@ from .toml import read_table
 comptime MUTANTS_DIR = "mutants"
 comptime _KNOWN_KEYS = (
     " paths_to_mutate tests_dir include_dirs also_copy do_not_mutate build_args mojo"
-    " timeout_multiplier timeout_floor "
+    " timeout_multiplier timeout_floor sandbox_tests "
 )
 
 
@@ -26,6 +26,8 @@ struct Config(Copyable, Movable):
     var mojo: List[String]  # empty: find one
     var timeout_multiplier: Float64
     var timeout_floor: Float64
+    # keep tests from signaling processes they didn't start (macOS)
+    var sandbox_tests: Bool
 
     def __init__(out self, root: String, var paths_to_mutate: List[String], tests_dir: String, var include_dirs: List[String]):
         self.root = root
@@ -38,6 +40,7 @@ struct Config(Copyable, Movable):
         self.mojo = List[String]()
         self.timeout_multiplier = 10.0
         self.timeout_floor = 2.0
+        self.sandbox_tests = True
 
     def mutants_dir(self) -> String:
         return join(self.root, MUTANTS_DIR)
@@ -96,6 +99,7 @@ def load_config(root: String) raises -> Config:
         config.mojo = settings.str_list("mojo")
     config.timeout_multiplier = settings.float_or("timeout_multiplier", 10.0)
     config.timeout_floor = settings.float_or("timeout_floor", 2.0)
+    config.sandbox_tests = not settings.has("sandbox_tests") or settings.get("sandbox_tests").as_bool()
     return config^
 
 

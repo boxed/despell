@@ -75,6 +75,18 @@ def test_merging_keeps_a_kill_another_run_saved_meanwhile() raises:
     assert_equal(merge_result(survived, mutant(KILLED, "other code"), None, False).status, String(SURVIVED))
 
 
+def test_a_build_remembers_what_compiles_for_mutants_it_didnt_run() raises:
+    # an interrupted run built mutants it never got to: a resumed run can
+    # skip pre-checking them
+    var built = mutant()
+    built.compiles = True
+    var saved = merge_result(built, mutant(), None, False)
+    assert_equal(saved.status, String("not_checked"))
+    assert_true(saved.compiles)
+    assert_true(MutantRecord.from_json(saved.to_json()).compiles)
+    assert_false(MutantRecord.from_json(mutant().to_json()).compiles)
+
+
 def test_a_large_state_saves_and_loads_quickly() raises:
     # turbokod has ~53k mutants (25 MB of state), saved every 10s during a
     # run; anything quadratic in reading or writing it stalls the run

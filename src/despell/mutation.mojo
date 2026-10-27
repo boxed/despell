@@ -691,34 +691,52 @@ from std.os import getenv as _despell_getenv
 from std.os import abort as _despell_abort
 
 
-def _despell_init_mutant() -> Int:
+# (despell's own functions start with `_despell`, so no methods)
+@fieldwise_init
+struct _DespellState(Movable):
+    var magic: Int
+    var mutant: Int
+    # in coverage mode (mutant -1): what has run, by fid and by site
+    var hits: List[Bool]
+    var sites: List[Bool]
+
+
+def _despell_init_state() -> _DespellState:
+    var mutant = 0
     try:
-        return Int(_despell_getenv("DESPELL_MUTANT", "0"))
+        mutant = Int(_despell_getenv("DESPELL_MUTANT", "0"))
     except:
-        return 0
+        pass
+    var coverage = mutant == -1
+    return _DespellState(
+        _DESPELL_MAGIC,
+        mutant,
+        List[Bool](length=N_FUNCTIONS if coverage else 0, fill=False),
+        List[Bool](length=N_MUTANTS if coverage else 0, fill=False),
+    )
 
 
-def _despell_init_hits() -> List[Bool]:
-    return List[Bool](length=N_FUNCTIONS, fill=False)
+comptime _DESPELL_MAGIC = 0x64657370656C6C21
+comptime _DESPELL_SLOT = 2
+comptime _despell_state = _DespellGlobal["despell_state", _despell_init_state]
 
 
-comptime _despell_mutant = _DespellGlobal["despell_mutant", _despell_init_mutant]
-comptime _despell_hits = _DespellGlobal["despell_hits", _despell_init_hits]
-
-
-def _despell_init_sites() -> List[Bool]:
-    return List[Bool](length=N_MUTANTS, fill=False)
-
-
-comptime _despell_sites = _DespellGlobal["despell_sites", _despell_init_sites]
+def _despell_get() raises -> _despell_state.ResultType:
+    # an indexed slot is several times faster than a lookup by name, which
+    # matters in hot code, but the runtime only has 3 and doesn't reserve
+    # them: use it only if it holds ours
+    var p = _despell_state.get_or_create_indexed_ptr(_DESPELL_SLOT)
+    if p[].magic == _DESPELL_MAGIC:
+        return p
+    return _despell_state.get_or_create_ptr()
 
 
 def _despell_site(key: Int):
     \"\"\"Records that a statement holding mutants ran, in coverage mode.\"\"\"
     try:
-        var hits = _despell_sites.get_or_create_ptr()
-        if not hits[][key]:
-            hits[][key] = True
+        var s = _despell_get()
+        if not s[].sites[key]:
+            s[].sites[key] = True
             print("despell-site", key)
     except:
         pass
@@ -729,14 +747,13 @@ def _despell_active(fid: Int) -> Int:
     if __is_run_in_comptime_interpreter:
         return 0
     try:
-        var m = _despell_mutant.get_or_create_ptr()[]
-        if m == -1:
-            var hits = _despell_hits.get_or_create_ptr()
-            if not hits[][fid]:
-                hits[][fid] = True
-                # print rather than file I/O: the program already uses print,
-                # while extra FFI could clash with the user's own declarations
-                print("despell-hit", fid)
+        var s = _despell_get()
+        var m = s[].mutant
+        if m == -1 and not s[].hits[fid]:
+            s[].hits[fid] = True
+            # print rather than file I/O: the program already uses print,
+            # while extra FFI could clash with the user's own declarations
+            print("despell-hit", fid)
         return m
     except:
         return 0

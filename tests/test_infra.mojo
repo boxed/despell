@@ -2,6 +2,7 @@ from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
 from despell.fsutil import hash_text, join, parent, relative_to, basename
 from despell.jsonio import Json, encode, parse
+from despell.sysutil import ProcessPool, environment, memory_available
 from despell.toml import read_table
 
 
@@ -49,6 +50,31 @@ def test_paths() raises:
     assert_equal(parent("a/b/c.mojo"), String("a/b"))
     assert_equal(basename("a/b/c.mojo"), String("c.mojo"))
     assert_equal(relative_to("/x/y/z", "/x"), String("y/z"))
+
+
+def test_a_child_using_too_much_memory_is_stopped() raises:
+    var pool = ProcessPool()
+    var argv = List[String]()
+    for a in ["perl", "-e", "$x = 'a' x 400_000_000; sleep 10"]:
+        argv.append(String(a))
+    pool.start(1, argv, ".", environment(), 20, memory_limit=100_000_000)
+    var f = pool.wait_any()
+    assert_true(f.over_memory)
+    assert_true(f.memory > 100_000_000, String(f.memory))
+    assert_true(f.seconds < 5, String(f.seconds))
+
+
+def test_peak_memory_of_a_child() raises:
+    var pool = ProcessPool()
+    var argv = List[String]()
+    for a in ["perl", "-e", "$x = 'a' x 50_000_000"]:
+        argv.append(String(a))
+    pool.start(1, argv, ".", environment(), 20)
+    var f = pool.wait_any()
+    assert_false(f.over_memory)
+    assert_true(f.memory > 50_000_000, String(f.memory))
+    var available = memory_available()
+    assert_true(available > 0 and available <= 1, String(available))
 
 
 def test_hash_is_stable() raises:
