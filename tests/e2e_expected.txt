@@ -18,6 +18,10 @@ mylib.mathx.countdown.6 killed
 mylib.mathx.countdown.7 killed
 mylib.mathx.countdown.8 killed
 mylib.mathx.countdown.9 killed
+mylib.mathx.first_index.1 equivalent
+mylib.mathx.first_index.2 no_tests
+mylib.mathx.first_index.3 no_tests
+mylib.mathx.first_index.4 no_tests
 mylib.mathx.greeting.1 killed
 mylib.mathx.greeting.2 compile_error
 mylib.mathx.is_even.1 killed

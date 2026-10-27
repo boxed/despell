@@ -27,8 +27,10 @@ comptime TIMEOUT = "timeout"
 comptime COMPILE_ERROR = "compile_error"
 comptime SKIPPED = "skipped"
 comptime NOT_CHECKED = "not_checked"
+# compiles to the same code as the original (see `equivalence`)
+comptime EQUIVALENT = "equivalent"
 
-comptime STATUS_ORDER = "survived no_tests timeout not_checked skipped compile_error killed"
+comptime STATUS_ORDER = "survived no_tests timeout not_checked skipped equivalent compile_error killed"
 
 # version control, environments and caches: big, and no test reads them
 comptime NOT_COPIED = (
@@ -50,7 +52,7 @@ def is_actionable(status: String) -> Bool:
 
 def is_final(status: String) -> Bool:
     """Results that only change when the code or the tests do."""
-    return status == KILLED or status == SURVIVED or status == TIMEOUT or status == NO_TESTS
+    return status == KILLED or status == SURVIVED or status == TIMEOUT or status == NO_TESTS or status == EQUIVALENT
 
 
 struct MutantRecord(Copyable, Movable):
@@ -75,6 +77,9 @@ struct MutantRecord(Copyable, Movable):
     var tested_with: String
     # passed the pre-check in a build (so a resumed run can skip it)
     var compiles: Bool
+    # the version of the comparison with the original's code it's had (see
+    # `equivalence`), 0 for none: not again while the function doesn't change
+    var eq_checked: Int
 
     def __init__(
         out self, id: String, number: Int, fid: Int, file: String, line: Int, col: Int, end_col: Int,
@@ -99,6 +104,7 @@ struct MutantRecord(Copyable, Movable):
         self.site = site
         self.tested_with = String("")
         self.compiles = False
+        self.eq_checked = 0
 
     def to_json(self) -> Json:
         var j = Json.object()
@@ -121,6 +127,8 @@ struct MutantRecord(Copyable, Movable):
         j.set("tested_with", _opt(self.tested_with))
         if self.compiles:
             j.set("compiles", Json.of(True))
+        if self.eq_checked:
+            j.set("eq_checked", Json.of(self.eq_checked))
         return j^
 
     @staticmethod
@@ -136,6 +144,7 @@ struct MutantRecord(Copyable, Movable):
         m.detail = j.str_or("detail", "")
         m.tested_with = j.str_or("tested_with", "")
         m.compiles = j.has("compiles") and j.get("compiles").as_bool()
+        m.eq_checked = j.int_or("eq_checked", 0)
         return m^
 
     def location(self) -> String:
@@ -361,7 +370,7 @@ def plan(m: MutantRecord, old: Optional[MutantRecord], snapshots: Dict[String, D
     ref o = old.value()
     if o.fingerprint != m.fingerprint:
         return everything^
-    if o.status == COMPILE_ERROR or o.status == SKIPPED:
+    if o.status == COMPILE_ERROR or o.status == SKIPPED or o.status == EQUIVALENT:
         return Plan(False, True, Set[String](), False)  # the build carries these over
     if not is_final(o.status):
         return everything^
@@ -399,6 +408,7 @@ def merge_result(ours: MutantRecord, theirs: Optional[MutantRecord], seen: Optio
     if not ran_it:
         var kept = t.copy()
         kept.compiles = t.compiles or ours.compiles
+        kept.eq_checked = max(t.eq_checked, ours.eq_checked)
         return kept^
     var written_since = not seen or t.status != seen.value().status or t.tested_with != seen.value().tested_with
     if written_since and (t.status == KILLED or t.status == TIMEOUT) and (ours.status == SURVIVED or ours.status == NO_TESTS):

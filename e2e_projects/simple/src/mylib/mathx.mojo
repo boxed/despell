@@ -66,3 +66,14 @@ def countdown(n: Int) -> Int:
 
 def untested(x: Int) -> Int:
     return x * 7
+
+
+def first_index(xs: List[Int], v: Int) -> Int:
+    """Untested. `found` is set again before it's read, so a mutant of its
+    first value compiles to the same code: equivalent."""
+    var found = 0
+    found = -1
+    for i in range(len(xs)):
+        if xs[i] == v:
+            return i
+    return found

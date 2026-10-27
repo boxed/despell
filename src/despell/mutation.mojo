@@ -19,6 +19,7 @@ code grows linearly with the number of mutants.
 from std.collections import Set
 
 from .tokenizer import NAME, NUMBER, OP, STRING, LogicalLine, Token, TokenizedSource, tokenize
+from .textutil import split_lines
 
 comptime INDENT = "    "
 
@@ -880,7 +881,7 @@ struct _Emitter:
 
     def add_lines(mut self, text: String):
         """Add `text`, which may hold several lines, one line per entry."""
-        for line in text.splitlines(keepends=True):
+        for line in split_lines(text, keepends=True):
             self.out.append(String(line))
 
     def span(self, lines: List[String], sl: Int, sc: Int, el: Int, ec: Int, depth: Int) -> String:

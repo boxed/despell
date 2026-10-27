@@ -186,6 +186,28 @@ def test_regions_line_up_with_multiline_statements() raises:
         assert_true(found)
 
 
+def test_regions_line_up_past_a_tab_in_a_string() raises:
+    var src = String("def f(a: Int) -> String:\n    var s = \"x\ty\"\n    if a > 1:\n        return s\n    return \"z\"\n")
+    var gen = generate(src, analyze(src), 0, 1, 1)
+    var lines = gen.text.split("\n")
+    var checked = 0
+    for r in gen.regions:
+        if r.mutant < 0:
+            continue
+        var replacement = String("")
+        for f in gen.functions:
+            for gm in f.mutants:
+                if gm.number == r.mutant:
+                    replacement = gm.mutation.replacement
+        var found = False
+        for i in range(r.start, r.end + 1):
+            if replacement in lines[i]:
+                found = True
+        assert_true(found, replacement)
+        checked += 1
+    assert_true(checked > 0)
+
+
 def test_wrapped_expressions_stay_inside_their_block() raises:
     var src = String(
         "def f(a: Int, b: Int) -> Bool:\n    if not a and b > 1:\n        var ok = (\n"

@@ -9,6 +9,8 @@ one thread with `poll`.
 from std.ffi import external_call
 from std.sys.info import CompilationTarget
 
+from .textutil import split_lines
+
 
 def alloc_zero(n: Int) -> List[UInt8]:
     var buf = List[UInt8](capacity=n)
@@ -169,7 +171,7 @@ def cpu_ticks() -> CpuTicks:
         try:
             with open("/proc/stat", "r") as f:
                 # cpu  user nice system idle iowait irq softirq steal ...
-                var parts = f.read().splitlines()[0].split()
+                var parts = split_lines(f.read())[0].split()
                 var total = 0
                 for i in range(1, len(parts)):
                     total += Int(atol(parts[i]))
@@ -194,7 +196,7 @@ def memory_available() -> Float64:
             var total = 0
             var available = -1
             with open("/proc/meminfo", "r") as f:
-                for line in f.read().splitlines():
+                for line in split_lines(f.read()):
                     var parts = String(line).split()
                     if len(parts) >= 2 and parts[0] == "MemTotal:":
                         total = Int(atol(parts[1]))

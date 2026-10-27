@@ -14,7 +14,7 @@ from .project import Config, load_config
 from .session import run
 from .state import STATUS_ORDER, MutantRecord, TestRecord, is_actionable, load_state, matches
 from .sysutil import block_signals, environment, env_value
-from .textutil import join_words
+from .textutil import join_words, split_lines
 
 comptime AGENT_GUIDE = """despell: mutation testing for Mojo
 
@@ -69,6 +69,8 @@ Statuses:
   timeout        tests hung with the mutant applied (counts as killed)
   compile_error  the mutant doesn't compile (counts as killed)
   skipped        the function can't hold mutation schemata
+  equivalent     compiles to exactly the same code as the original, so no
+                 test can kill it (not counted in the score)
 
 Equivalent mutants (no input can tell them from the original, e.g. `x < lo`
 -> `x <= lo` in a clamp that returns `lo` either way) can't be killed: don't
@@ -144,7 +146,7 @@ def _summary(mutants: List[MutantRecord]):
             parts.append(String(n) + " " + String(status))
     var total = len(mutants)
     var killed = counts.get("killed", 0) + counts.get("timeout", 0) + counts.get("compile_error", 0)
-    var tested = total - counts.get("skipped", 0) - counts.get("not_checked", 0)
+    var tested = total - counts.get("skipped", 0) - counts.get("not_checked", 0) - counts.get("equivalent", 0)
     var score = String("")
     if tested:
         var permille = Int(1000.0 * Float64(killed) / Float64(tested) + 0.5)
@@ -337,7 +339,7 @@ def cmd_results(args: List[String]) raises -> Int:
 
 def mutant_diff(m: MutantRecord, root: String) raises -> String:
     """A unified diff of the mutant against the source, with 3 lines of context."""
-    var lines = read_text(join(root, m.file)).splitlines(keepends=True)
+    var lines = split_lines(read_text(join(root, m.file)), keepends=True)
     var i = m.line - 1
     if i >= len(lines):
         return "(source changed since the run; expected `" + m.original + "` at " + m.location() + ")\n"

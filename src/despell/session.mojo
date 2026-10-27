@@ -3,11 +3,12 @@
 from std.collections import Dict, Set
 from std.os import getenv
 
+from .equivalence import EQ_VERSION
 from .fsutil import join, mkdirs, rmtree, write_text, hash_text
 from .project import Config
 from .runner import Command, Run, discover_tests, log, run_parallel
 from .state import (
-    COMPILE_ERROR, KILLED, MAIN_LOCK, NO_TESTS, NOT_CHECKED, SIDE_DIR, SKIPPED, SURVIVED, TIMEOUT, MutantRecord, Plan, State,
+    COMPILE_ERROR, EQUIVALENT, KILLED, MAIN_LOCK, NO_TESTS, NOT_CHECKED, SIDE_DIR, SKIPPED, SURVIVED, TIMEOUT, MutantRecord, Plan, State,
     StateLock, TestRecord, is_actionable, matches, merge_result, plan, read_state, snapshot_id, test_file_hashes,
     write_state,
 )
@@ -15,7 +16,7 @@ from .sysutil import (
     CpuTicks, Finished, children_cpu_seconds, cpu_ticks, getpid, lock_file, memory_available, monotonic_ns, seconds_since,
     unlock_file, with_env,
 )
-from .textutil import first_failed_test, format_seconds, numbers_after
+from .textutil import first_failed_test, format_seconds, numbers_after, split_lines
 
 comptime STATS_MODE = "-1"
 # the snapshot entry naming each function number (see `_function_names`)
@@ -46,7 +47,7 @@ def _test_output(r: Run, output: String) -> String:
     despell's hooks print, the tests `--only` skipped and Mojo's boilerplate,
     and with paths into despell's copies of the project made relative to it."""
     var out = String("")
-    for line in output.splitlines():
+    for line in split_lines(output):
         var l = String(line)
         var stripped = String(l.strip())
         if (
@@ -799,6 +800,7 @@ def _run(
             m.detail = o.detail
             m.tested_with = o.tested_with
             m.compiles = o.compiles
+            m.eq_checked = o.eq_checked
         plans[m.number] = plan(m, old, before.snapshots, current)
     var chosen = List[Int]()
     for m in r.mutants:
@@ -819,7 +821,7 @@ def _run(
         )
     if len(selected) == 0:
         log("nothing to run: every result is up to date. `despell run --force <selector>` runs them anyway")
-        var state = _save(r, config, before, current, snap, Set[String]())
+        var state = _save(r, config, before, current, snap, _find_equivalent(r, chosen))
         return _records(state, r, chosen)
     for n in selected:
         r.mutants[n - 1].tested_with = snap
@@ -870,6 +872,9 @@ def _run(
     for n in selected:
         fresh.add(r.mutants[n - 1].id)
     var state = _save(r, config, before, current, snap, fresh)
+    for id in _find_equivalent(r, chosen):
+        fresh.add(id)
+    state = _save(r, config, before, current, snap, fresh)
     # killed by a test file that changed, and it no longer does
     var again = List[String]()
     for n in selected:
@@ -892,6 +897,36 @@ def _run(
     for item in state.mutants.items():
         all.append(item.value.copy())
     return all^
+
+
+def _find_equivalent(mut r: Run, chosen: List[Int]) raises -> Set[String]:
+    """Mark the survivors (and untested) of the `chosen` that compile to the
+    same code as the original `equivalent`: no test can kill them. Each is
+    only compared once, while its function doesn't change. Returns the ids
+    of the ones compared."""
+    var candidates = List[Int]()
+    var ids = Set[String]()
+    for n in chosen:
+        ref m = r.mutants[n - 1]
+        if (m.status == SURVIVED or m.status == NO_TESTS) and m.eq_checked < EQ_VERSION:
+            candidates.append(n)
+            ids.add(m.id)
+    if len(candidates) == 0:
+        return ids^
+    var t0 = monotonic_ns()
+    var found = r.find_equivalent(candidates)
+    for n in candidates:
+        r.mutants[n - 1].eq_checked = EQ_VERSION
+    for n in found:
+        r.mutants[n - 1].status = EQUIVALENT
+        r.mutants[n - 1].killed_by = String("")
+        r.mutants[n - 1].detail = String("compiles to the same code as the original")
+    log(
+        "compared " + String(len(candidates)) + " surviving mutants' code with the original's ("
+        + format_seconds(seconds_since(t0)) + "s): " + String(len(found)) + " compile to the same code, so are "
+        + "equivalent"
+    )
+    return ids^
 
 
 def _records(state: State, r: Run, numbers: List[Int]) -> List[MutantRecord]:

@@ -8,12 +8,13 @@ of those, which may span lines.
 """
 
 from .jsonio import Json
+from .textutil import split_lines
 
 
 def read_table(text: String, path: String) raises -> Optional[Json]:
     """The table at dotted `path` ("" for the top level) as a JSON object, or
     None if the file doesn't have it."""
-    var lines = text.splitlines()
+    var lines = split_lines(text)
     var current = String("")
     var found = path.byte_length() == 0
     var table = Json.object()

@@ -3,6 +3,30 @@
 from std.collections import Set
 
 
+def split_lines(text: String, keepends: Bool = False) -> List[String]:
+    """`text`'s lines, split on `\n` only (and without a `\r` before it,
+    unless `keepends`). `String.splitlines` also splits on tabs and other
+    control characters, which source code, compiler output and assembly
+    have inside their lines."""
+    var out = List[String]()
+    var bytes = text.as_bytes()
+    var start = 0
+    var n = text.byte_length()
+    while start < n:
+        var end = text.find("\n", start)
+        if end < 0:
+            out.append(String(text[byte=start:]))
+            break
+        if keepends:
+            out.append(String(text[byte = start : end + 1]))
+        elif end > start and bytes[end - 1] == 13:  # "\r": a byte, not a slice, which could start mid-character
+            out.append(String(text[byte = start : end - 1]))
+        else:
+            out.append(String(text[byte=start:end]))
+        start = end + 1
+    return out^
+
+
 def glob_match(pattern: String, text: String) -> Bool:
     """`fnmatch`-style matching: `*`, `?` and `[...]` (case-sensitive)."""
     return _glob(pattern.as_bytes(), 0, text.as_bytes(), 0)
@@ -76,7 +100,7 @@ def _digits_end(text: String, start: Int) -> Int:
 def parse_diagnostics(output: String) -> List[Diagnostic]:
     """The `file.mojo:line:col: error|note: message` lines in compiler output."""
     var result = List[Diagnostic]()
-    for raw in output.splitlines():
+    for raw in split_lines(output):
         var line = String(raw)
         var at = line.find(".mojo:")
         while at >= 0:
@@ -103,7 +127,7 @@ def link_references(output: String) -> List[String]:
     """Functions referencing an undefined symbol, in linker output:
     `    _pkg::mod::Struct::method(::String) in mojo_archive-a8b61e5.a`."""
     var result = List[String]()
-    for raw in output.splitlines():
+    for raw in split_lines(output):
         var line = String(raw)
         if not (line.startswith(" ") or line.startswith("\t")):
             continue
@@ -120,7 +144,7 @@ def numbers_after(output: String, prefix: String) -> List[Int]:
     """The numbers on lines that are `prefix` then a number, sorted, unique."""
     var seen = Set[Int]()
     var result = List[Int]()
-    for raw in output.splitlines():
+    for raw in split_lines(output):
         var line = String(raw)
         if line.startswith(prefix):
             try:
@@ -136,7 +160,7 @@ def numbers_after(output: String, prefix: String) -> List[Int]:
 
 def first_failed_test(output: String) -> String:
     """The name of the first failing test in TestSuite output, or ""."""
-    for raw in output.splitlines():
+    for raw in split_lines(output):
         var line = String(String(raw).lstrip())
         if line.startswith("FAIL ["):
             var close = line.find("] ")
@@ -148,7 +172,7 @@ def first_failed_test(output: String) -> String:
 
 
 def first_error(output: String) -> String:
-    for raw in output.splitlines():
+    for raw in split_lines(output):
         var line = String(raw)
         var at = line.find(" error: ")
         if at >= 0 and not String(line.rstrip()).endswith("failed to run the pass manager"):
@@ -161,7 +185,7 @@ def without_warnings(output: String) -> String:
     var kept = List[String]()
     var pending = List[String]()  # "Included from" lines that precede a diagnostic
     var keep = True
-    for raw in output.splitlines():
+    for raw in split_lines(output):
         var line = String(raw)
         if line.startswith("Included from") or line.startswith("Imported from"):
             pending.append(line)
@@ -189,7 +213,7 @@ def without_warnings(output: String) -> String:
 def absolutize_imports(text: String, package: List[String]) -> String:
     """Rewrite `from .x import y` to `from pkg.x import y`, given the module's package."""
     var out = String("")
-    for raw in text.splitlines(keepends=True):
+    for raw in split_lines(text, keepends=True):
         var line = String(raw)
         var stripped = String(line.lstrip())
         var indent = String(line[byte = 0 : line.byte_length() - stripped.byte_length()])

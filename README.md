@@ -170,6 +170,19 @@ at half the cores and follows the CPU the tests use: tests that mostly wait (on
 I/O, the network, a mutant's timeout) get more workers, until the cores are
 busy or the machine is loaded with other work.
 
+**Equivalent mutants.** Some mutants can't be killed because they don't
+change anything: a dead store (`var i = 0` -> `var i = 1` where `i` is set
+again before it's read), `<` -> `<=` in a `max`, a branch that's never taken.
+After a run, each surviving (or untested) mutant's function is compiled with
+optimization, once unmutated and once with the mutant, as exported copies in
+the same module; when the two come out as exactly the same machine code, the
+mutant is `equivalent`: not listed to act on, and not counted in the score.
+Labels, data and the source line numbers that end up in the code are
+compared so that anything not accounted for counts as different, never the
+same. It finds a few percent of survivors (2-6% on turbokod), at a few
+seconds per module, once per mutant while its function doesn't change.
+Constructors, parametric and nested functions can't be checked this way.
+
 **The sandbox.** Code that stops its child processes is one mutant away from
 `kill(-1, SIGTERM)` (`if alive and pid > 0` -> `if alive or pid > 0`, with
 `pid == -1`), which signals every process the user has: on a desktop, that's

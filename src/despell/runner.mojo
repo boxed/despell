@@ -14,10 +14,11 @@ from std.os.path import isdir
 from std.sys.info import CompilationTarget
 
 from .fsutil import (
-    copy_file, copy_tree, hash_bytes, hash_text, read_bytes, is_dir, is_file, join, list_dir, mkdirs, parent, path_exists, read_text,
+    basename, copy_file, copy_tree, hash_bytes, hash_text, read_bytes, is_dir, is_file, join, list_dir, mkdirs, parent, path_exists, read_text,
     real_path, relative_to, remove_file, rmtree, walk_files, write_text, Hasher,
 )
 from .jsonio import Json, encode, parse
+from .equivalence import EQ_GAP, EqCandidate, EqModule, can_copy, equivalence_module, equivalent_copies, parse_assembly
 from .mutation import Function, GeneratedFile, Region, analyze, generate
 from .project import Config, MojoEnv, find_mojo
 from .state import (
@@ -28,7 +29,7 @@ from .state import (
 from .sysutil import Finished, ProcessPool, environment, executable_path, getpid, lock_file, monotonic_ns, run_command, seconds_since, unlock_file, with_env
 from .textutil import (
     Diagnostic, absolutize_imports, first_error, first_failed_test, format_seconds, glob_match, join_words,
-    link_references, numbers_after, parse_diagnostics, without_warnings,
+    link_references, numbers_after, parse_diagnostics, split_lines, without_warnings,
 )
 from .tokenizer import tokenize
 
@@ -318,6 +319,10 @@ struct _Frame(Copyable, Movable):
     var message: String
 
 
+# Lines of copies per compile when looking for equivalent mutants
+comptime EQ_BATCH_LINES = 20000
+
+
 # Lets a test signal only what's in its sandbox and its process group, which
 # despell gives each test process (a macOS sandbox profile)
 comptime SIGNAL_SANDBOX = (
@@ -472,7 +477,7 @@ struct Run(Movable):
                 continue
             if len(functions) == 0:
                 continue
-            var lines = source.splitlines(keepends=True)
+            var lines = split_lines(source, keepends=True)
             var line_list = List[String]()
             for l in lines:
                 line_list.append(String(l))
@@ -859,9 +864,11 @@ struct Run(Movable):
 
     # ---- the pre-check -------------------------------------------------------
 
-    def _check_command(self, path: String) -> Command:
+    def _check_command(self, path: String, emit: String = "llvm") -> Command:
+        """Compile `path` to `<path>.ll` (or with `emit` "asm", optimized,
+        to `<path>.s`)."""
         var cmd = self.mojo.command.copy()
-        for a in ["build", "--disable-warnings", "--emit", "llvm", "--elaboration-error-limit=0"]:
+        for a in ["build", "--disable-warnings", "--emit", emit, "--elaboration-error-limit=0"]:
             cmd.append(String(a))
         for inc in self.config.include_dirs:
             cmd.append("-I")
@@ -870,10 +877,104 @@ struct Run(Movable):
             cmd.append(a)
         cmd.append(path)
         cmd.append("-o")
-        cmd.append(path + ".ll")
+        cmd.append(path + (".ll" if emit == "llvm" else ".s"))
         # imports resolve against the original project, so each module is
         # checked with its own mutants and no one else's
         return Command(cmd^, self.config.root, self.mojo.env.copy(), 0)
+
+    def find_equivalent(mut self, candidates: List[Int]) raises -> Set[Int]:
+        """Of the mutants (numbers), the ones whose function compiles to the
+        same code with them as without (see `equivalence`)."""
+        self.find_mojo()
+        var wanted = Set[Int]()
+        for n in candidates:
+            wanted.add(n)
+        var check_dir = join(self.work, "check")
+        mkdirs(check_dir)
+        var commands = List[Command]()
+        var modules = List[EqModule]()
+        var paths = List[String]()
+        var batch_files = List[Int]()
+        var batch_cands = List[List[EqCandidate]]()
+        for fi in range(len(self.files)):
+            ref sf = self.files[fi]
+            var lines = List[String]()
+            for l in split_lines(absolutize_imports(sf.source, sf.package), keepends=True):
+                lines.append(String(l))
+            var number = sf.first_mutant
+            var cands = List[EqCandidate]()
+            var size = 0
+            for k in range(len(sf.functions)):
+                ref f = sf.functions[k]
+                var mine = List[EqCandidate]()
+                for m in f.mutations():
+                    if number in wanted:
+                        mine.append(EqCandidate(number, k, m.line, m.col, m.end_col, m.replacement))
+                    number += 1
+                if len(mine) == 0 or not can_copy(lines, f):
+                    continue
+                # a batch is one compile: split big files over several
+                var cost = (f.body_end - f.def_line + EQ_GAP) * (len(mine) + 1)
+                if size > 0 and size + cost > EQ_BATCH_LINES:
+                    batch_files.append(fi)
+                    batch_cands.append(cands^)
+                    cands = List[EqCandidate]()
+                    size = 0
+                for c in mine:
+                    cands.append(c.copy())
+                size += cost
+            if len(cands) > 0:
+                batch_files.append(fi)
+                batch_cands.append(cands^)
+        var found = Set[Int]()
+        for _ in range(3):
+            if len(batch_files) == 0:
+                break
+            commands = List[Command]()
+            modules = List[EqModule]()
+            paths = List[String]()
+            for b in range(len(batch_files)):
+                ref sf = self.files[batch_files[b]]
+                var lines = List[String]()
+                for l in split_lines(absolutize_imports(sf.source, sf.package), keepends=True):
+                    lines.append(String(l))
+                var mod = equivalence_module(lines, sf.functions, batch_cands[b])
+                var path = join(check_dir, sf.module + ".eq" + String(b) + ".mojo")
+                write_text(path, mod.text)
+                commands.append(self._check_command(path, "asm"))
+                modules.append(mod^)
+                paths.append(path)
+            var results = run_parallel(commands, self.workers)
+            var retry_files = List[Int]()
+            var retry_cands = List[List[EqCandidate]]()
+            for b in range(len(results)):
+                if results[b].code == 0:
+                    var asm = parse_assembly(read_text(paths[b] + ".s"))
+                    for n in equivalent_copies(asm, modules[b].copies):
+                        found.add(n)
+                    remove_file(paths[b] + ".s")
+                    continue
+                # drop the functions whose copies don't compile; the rest
+                # get another go
+                var broken = Set[Int]()
+                for d in parse_diagnostics(results[b].output):
+                    if not d.is_error or not paths[b].endswith(basename(d.path)):
+                        continue
+                    for c in modules[b].copies:
+                        if d.line + 1 >= c.first_line - 2 and d.line + 1 <= c.last_line:
+                            broken.add(c.fn_index)
+                if len(broken) == 0:
+                    continue  # not the copies' fault: give up on these
+                var kept = List[EqCandidate]()
+                for c in batch_cands[b]:
+                    if not (c.fn_index in broken):
+                        kept.append(c.copy())
+                if len(kept) > 0:
+                    retry_files.append(batch_files[b])
+                    retry_cands.append(kept^)
+            batch_files = retry_files^
+            batch_cands = retry_cands^
+        return found^
 
     def _chains(self, output: String, checked: String) -> List[List[_Frame]]:
         """The error chains in a check's output: each error and its notes,
