@@ -12,7 +12,7 @@ from .fsutil import join, read_text, real_path
 from .jsonio import Json, encode
 from .project import Config, load_config
 from .session import run
-from .state import STATUS_ORDER, MutantRecord, TestRecord, is_actionable, load_state, matches
+from .state import STATUS_ORDER, MutantRecord, TestRecord, is_actionable, load_state, note_matches, unmatched_error
 from .sysutil import block_signals, environment, env_value
 from .textutil import join_words, split_lines
 
@@ -280,11 +280,13 @@ def _load_selected(config: Config, selectors: List[String]) raises -> List[Mutan
     if len(state.mutants) == 0:
         raise Error("no results yet; run `despell run` first")
     var result = List[MutantRecord]()
+    var matched = List[Bool](length=len(selectors), fill=False)
     for item in state.mutants.items():
-        if len(selectors) == 0 or matches(item.value, selectors):
+        if len(selectors) == 0 or note_matches(item.value, selectors, matched):
             result.append(item.value.copy())
-    if len(selectors) and len(result) == 0:
-        raise Error("no mutants match " + join_words(selectors, " "))
+    var unmatched = unmatched_error(selectors, matched)
+    if unmatched:
+        raise Error(unmatched)
     return _sorted(result)
 
 

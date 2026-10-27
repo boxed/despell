@@ -3,7 +3,10 @@ from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
 from despell.fsutil import mkdirs, real_path, rmtree
 from despell.project import load_config
-from despell.state import KILLED, SURVIVED, MutantRecord, State, TestRecord, merge_result, plan, read_state, write_state
+from despell.state import (
+    KILLED, SURVIVED, MutantRecord, State, TestRecord, merge_result, note_matches, plan, read_state, unmatched_error,
+    write_state,
+)
 from despell.sysutil import monotonic_ns, seconds_since
 
 
@@ -81,6 +84,17 @@ def test_merging_keeps_a_kill_another_run_saved_meanwhile() raises:
     assert_equal(merge_result(survived, killed.copy(), killed.copy(), True).status, String(SURVIVED))
     assert_equal(merge_result(survived, killed.copy(), before.copy(), False).status, String(KILLED))
     assert_equal(merge_result(survived, mutant(KILLED, "other code"), None, False).status, String(SURVIVED))
+
+
+def test_every_selector_that_matches_nothing_is_named() raises:
+    var selectors: List[String] = ["m.f", "src/m.mojo:1", "m.g", "src/m.mojo::f", "m.*.1"]
+    var matched = List[Bool](length=len(selectors), fill=False)
+    assert_true(note_matches(mutant(), selectors, matched))
+    assert_equal(String(matched), String([True, True, False, False, True]))
+    var error = unmatched_error(selectors, matched)
+    assert_true(error.startswith("no mutants match m.g src/m.mojo::f ("), error)
+    matched = [True, True, True, True, True]
+    assert_equal(unmatched_error(selectors, matched), "")
 
 
 def test_a_result_kept_from_before_moves_with_the_code() raises:

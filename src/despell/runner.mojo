@@ -23,7 +23,7 @@ from .mutation import Function, GeneratedFile, Region, analyze, generate
 from .project import Config, MojoEnv, find_mojo
 from .state import (
     COMPILE_ERROR, KILLED, MAIN_LOCK, NO_TESTS, NOT_CHECKED, SIDE_DIR, SKIPPED, STATE_FILE, STATE_LOCK, SURVIVED,
-    TIMEOUT, MutantRecord, Plan, State, StateLock, TestRecord, is_actionable, is_final, matches, merge_result,
+    TIMEOUT, MutantRecord, Plan, State, StateLock, TestRecord, is_actionable, is_final, merge_result,
     not_copied, plan, read_state, snapshot_id, test_file_hashes, write_state,
 )
 from .sysutil import Finished, ProcessPool, environment, executable_path, getpid, lock_file, monotonic_ns, run_command, seconds_since, unlock_file, with_env

@@ -467,19 +467,40 @@ def _result_of(ours: MutantRecord, theirs: MutantRecord) -> MutantRecord:
     return m^
 
 
-def matches(m: MutantRecord, selectors: List[String]) -> Bool:
-    for s in selectors:
-        if glob_match(s, m.id) or m.id.startswith(s + "."):
-            return True
-        var colon = s.rfind(":")
-        if colon >= 0:
-            # file:line
-            try:
-                var line = atol(String(s[byte = colon + 1 :]))
-                if m.file == String(s[byte=0:colon]) and m.line == line:
-                    return True
-            except:
-                pass
-        elif m.file == s:
-            return True
-    return False
+def note_matches(m: MutantRecord, selectors: List[String], mut matched: List[Bool]) -> Bool:
+    """Whether `m` is selected, marking each selector that selects it."""
+    var any = False
+    for i in range(len(selectors)):
+        if _matches_one(m, selectors[i]):
+            matched[i] = True
+            any = True
+    return any
+
+
+def unmatched_error(selectors: List[String], matched: List[Bool]) -> String:
+    """The error for selectors that matched nothing (empty when all did): a
+    typo would otherwise quietly leave mutants out."""
+    var missing = String("")
+    for i in range(len(selectors)):
+        if not matched[i]:
+            missing += (" " if missing else "") + selectors[i]
+    if not missing:
+        return ""
+    return (
+        "no mutants match " + missing + " (selectors are a mutant id like mylib.math.clamp.2, a function or module"
+        " prefix like mylib.math.clamp, a glob, a source file, or file:line)"
+    )
+
+
+def _matches_one(m: MutantRecord, s: String) -> Bool:
+    if glob_match(s, m.id) or m.id.startswith(s + "."):
+        return True
+    var colon = s.rfind(":")
+    if colon >= 0:
+        # file:line
+        try:
+            var line = atol(String(s[byte = colon + 1 :]))
+            return m.file == String(s[byte=0:colon]) and m.line == line
+        except:
+            return False
+    return m.file == s

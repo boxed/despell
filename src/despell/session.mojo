@@ -9,8 +9,8 @@ from .project import Config
 from .runner import WORK_DIR, Command, Run, discover_tests, log, run_parallel
 from .state import (
     COMPILE_ERROR, EQUIVALENT, KILLED, MAIN_LOCK, NO_TESTS, NOT_CHECKED, SIDE_DIR, SKIPPED, SURVIVED, TIMEOUT, MutantRecord, Plan, State,
-    StateLock, TestRecord, is_actionable, matches, merge_result, plan, read_state, snapshot_id, test_file_hashes,
-    write_state,
+    StateLock, TestRecord, is_actionable, merge_result, note_matches, plan, read_state, snapshot_id, test_file_hashes,
+    unmatched_error, write_state,
 )
 from .sysutil import (
     CpuTicks, Finished, children_cpu_seconds, cpu_ticks, getpid, kill_strays, lock_file, memory_available, monotonic_ns, seconds_since,
@@ -814,13 +814,15 @@ def _run(
             m.eq_checked = o.eq_checked
         plans[m.number] = plan(m, old, before.snapshots, current)
     var chosen = List[Int]()
+    var matched = List[Bool](length=len(selectors), fill=False)
     for m in r.mutants:
-        if len(selectors) == 0 or matches(m, selectors):
+        if len(selectors) == 0 or note_matches(m, selectors, matched):
             chosen.append(m.number)
             if force:
                 plans[m.number] = Plan(True, True, Set[String](), False)
-    if len(selectors) > 0 and len(chosen) == 0:
-        raise Error("no mutants match " + _joined(selectors))
+    var unmatched = unmatched_error(selectors, matched)
+    if unmatched:
+        raise Error(unmatched)
     var selected = List[Int]()
     for n in chosen:
         if plans[n].run:
@@ -946,13 +948,4 @@ def _records(state: State, r: Run, numbers: List[Int]) -> List[MutantRecord]:
         var id = r.mutants[n - 1].id
         var m = state.mutants.get(id)
         out.append(m.value().copy() if m else r.mutants[n - 1].copy())
-    return out^
-
-
-def _joined(words: List[String]) -> String:
-    var out = String("")
-    for i in range(len(words)):
-        if i:
-            out += " "
-        out += words[i]
     return out^
