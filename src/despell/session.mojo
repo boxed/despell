@@ -421,7 +421,7 @@ def run_mutants(
             f = r._pool.wait_any()
         except e:
             # Ctrl-C: keep what's done
-            _save(r, config, before, current, snap, done)
+            _ = _save(r, config, before, current, snap, done)
             _write_timings(r, timings)
             log("interrupted after " + String(len(done)) + "/" + String(len(todo)) + " mutants; `despell run` continues from there")
             raise e^
@@ -470,7 +470,7 @@ def run_mutants(
             )
             last_report = now
         if now - last_save > save_gap:
-            _save(r, config, before, current, snap, done)
+            _ = _save(r, config, before, current, snap, done)
             last_save = monotonic_ns()
             var took = last_save - now
             # don't let saving crowd out testing: nothing runs meanwhile

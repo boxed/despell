@@ -793,12 +793,18 @@ struct Run(Movable):
                     reached.add(n)
             enabled = reached^
         var t_check0 = monotonic_ns()
-        self.converge(enabled, disabled_functions, "llvm", True)
+        var cover = self._covering_files(enabled)
+        if len(cover) > 0:
+            self.converge(enabled, disabled_functions, "llvm", True, cover)
         var t1 = seconds_since(t_check0) + t_pre
         var built = self.build_all(enabled, disabled_functions, "exe", List[String]())
         if len(built.failures) > 0:
-            # rare: rejected only by the LLVM backend
-            self.converge(enabled, disabled_functions, "exe", True)
+            # rare: rejected only by the LLVM backend, or by a test file the
+            # check left out (one using a generic function differently)
+            var failed = List[String]()
+            for f in built.failures:
+                failed.append(f.file)
+            self.converge(enabled, disabled_functions, "exe", True, failed)
         self.enabled = enabled^
         self.disabled_functions = disabled_functions^
         self._write_manifest(manifest)
@@ -812,6 +818,38 @@ struct Run(Movable):
             + "s (" + String(self.n_builds) + " builds; checking mutants took " + format_seconds(t1)
             + "s, of which " + format_seconds(t_pre) + "s pre-checking modules; " + String(rejected) + " rejected)"
         )
+
+    def _covering_files(self, enabled: Set[Int]) -> List[String]:
+        """Few test files that together hold every mutant of `enabled`, for
+        the check before the real build: a mutant that doesn't compile fails
+        every build that has it, so checking every test file (each one a
+        whole build of the project) mostly repeats the same work."""
+        var files = self.test_files()
+        var sets = List[Set[Int]]()
+        var left = Set[Int]()
+        for f in files:
+            var s = self.set_for(f, enabled)
+            for n in s:
+                left.add(n)
+            sets.append(s^)
+        var out = List[String]()
+        while len(left) > 0:
+            var best = -1
+            var best_n = 0
+            for i in range(len(files)):
+                var n = 0
+                for m in sets[i]:
+                    if m in left:
+                        n += 1
+                if n > best_n:
+                    best = i
+                    best_n = n
+            if best < 0:
+                break
+            out.append(files[best])
+            for m in sets[best]:
+                left.discard(m)
+        return out^
 
     def _build_key(mut self, disabled_functions: List[Int]) raises -> String:
         """A hash of what the binaries are built from, besides the test files
@@ -918,9 +956,9 @@ struct Run(Movable):
             wanted.add(n)
         var check_dir = join(self.work, "check")
         mkdirs(check_dir)
-        var commands = List[Command]()
-        var modules = List[EqModule]()
-        var paths = List[String]()
+        var commands: List[Command]
+        var modules: List[EqModule]
+        var paths: List[String]
         var batch_files = List[Int]()
         var batch_cands = List[List[EqCandidate]]()
         for fi in range(len(self.files)):

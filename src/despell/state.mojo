@@ -276,7 +276,7 @@ struct StateLock:
         unlock_file(self.fd)
         self.fd = -1
 
-    def __del__(deinit self):
+    def __deinit__(deinit self):
         unlock_file(self.fd)
 
 
