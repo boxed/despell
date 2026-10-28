@@ -271,7 +271,9 @@ def cmd_run(args: List[String]) raises -> Int:
     # without -j, the number of workers adapts to the CPU the tests use
     var mutants = run(config, selectors, workers if workers > 0 else _default_workers(), force, workers == 0)
     print()
-    _report(mutants, len(selectors) > 0)
+    # Each survivor was listed as it was found: a long list again would
+    # double the output, so that's per function.
+    _report(mutants, False)
     return 0
 
 
