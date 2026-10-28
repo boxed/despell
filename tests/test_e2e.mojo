@@ -153,6 +153,9 @@ def test_6_new_test_file_is_checked_against_survivors_only() raises:
     # changed files (test_mathx changed back after the test above), so
     # test_tricky isn't even built
     assert_true("building the 2 of 3 test files" in out, out)
+    # survivors test_bits doesn't reach keep their result, untold one by one
+    assert_true("22 of them keep their result" in out, out)
+    assert_false("survived   mylib.tricky" in out, out)
     var s = statuses()
     assert_equal(s["mylib.tricky.bits.1"], String("killed"))
     assert_equal(s["mylib.mathx.add.1"], String("killed"))

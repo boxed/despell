@@ -377,6 +377,24 @@ def run_mutants(
             todo.append(n)
     if len(todo) == 0:
         return
+    # With tests restricted to new or changed files, none of which reach
+    # it, a mutant's earlier result stands
+    var kept = Set[Int]()
+    for n in todo:
+        if n in r.allowed and len(_tests_for(r, r.mutants[n - 1], by_fid, by_site)) == 0:
+            kept.add(n)
+    if len(kept) > 0:
+        log(
+            String(len(kept)) + " of them keep their result: no test in the new or changed test files reaches "
+            + ("it" if len(kept) == 1 else "them")
+        )
+        var rest = List[Int]()
+        for n in todo:
+            if not (n in kept):
+                rest.append(n)
+        todo = rest^
+    if len(todo) == 0:
+        return
     _slow_tests(r, todo, by_fid, by_site)
     var scaler = _Scaler(adaptive, r.workers)
     log(
@@ -402,13 +420,10 @@ def run_mutants(
             next += 1
             var tests = _tests_for(r, r.mutants[n - 1], by_fid, by_site)
             if len(tests) == 0:
-                # with tests restricted to new or changed files, none of
-                # which reach it, the earlier result stands
-                if not (n in r.allowed):
-                    r.mutants[n - 1].status = NO_TESTS
-                    r.mutants[n - 1].killed_by = String("")
-                    r.mutants[n - 1].detail = String("")
                 done.add(r.mutants[n - 1].id)
+                r.mutants[n - 1].status = NO_TESTS
+                r.mutants[n - 1].killed_by = String("")
+                r.mutants[n - 1].detail = String("")
                 _report(r.mutants[n - 1])
                 continue
             var job = _Job(n, _batches(r, tests), 0, monotonic_ns(), 0, 0)
