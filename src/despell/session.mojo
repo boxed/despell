@@ -794,6 +794,7 @@ def _run(
     current["sources"] = hash_text(sources)
     var snap = snapshot_id(current)
     r.test_hashes = current.copy()
+    r.adopt_moved(before.mutants)
     log(
         "generated " + String(len(r.mutants)) + " mutants in " + String(r.n_functions) + " functions across "
         + String(len(r.files)) + " files; " + String(len(all_tests)) + " tests"

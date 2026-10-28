@@ -513,6 +513,33 @@ struct Run(Movable):
             )
         self.n_functions = fid
 
+    def adopt_moved(self, mut previous: Dict[String, MutantRecord]) raises:
+        """Give the earlier result of each mutant whose function only moved
+        (same body, at other lines) this run's fingerprint, so that it
+        stands: the fingerprint has the mutant's line in it, so a line added
+        above a function used to send every mutant in it to be run again."""
+        var lines_of = Dict[Int, List[String]]()
+        var file_of = List[Int]()
+        for fi in range(len(self.files)):
+            for _ in self.files[fi].functions:
+                file_of.append(fi)
+        for m in self.mutants:
+            var old = previous.get(m.id)
+            if not old or old.value().fingerprint == m.fingerprint or old.value().line == m.line:
+                continue
+            var fi = file_of[m.fid]
+            ref sf = self.files[fi]
+            if not (fi in lines_of):
+                var lines = List[String]()
+                for l in split_lines(sf.source, keepends=True):
+                    lines.append(String(l))
+                lines_of[fi] = lines^
+            ref f = sf.functions[m.fid - sf.first_fid]
+            if _fingerprint(lines_of[fi], f, m.description, old.value().line - 1) == old.value().fingerprint:
+                var moved = old.value().copy()
+                moved.fingerprint = m.fingerprint
+                previous[m.id] = moved^
+
     # ---- phase 2: build ------------------------------------------------------
 
     def generate_file(

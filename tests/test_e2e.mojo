@@ -181,14 +181,30 @@ def test_7_coverage_first() raises:
 def test_7b_editing_the_code_keeps_rechecks_small() raises:
     # a new function shifts the numbers of every mutant after it, but the
     # tests that reached clamp before still tell which files to build
+    # (clamp only moved, so its results stand: --force runs it anyway)
     var path = join(PROJECT, "src/mylib/mathx.mojo")
     var source = read_text(path)
     write_text(path, source.replace("def add(", "def extra() -> Int:\n    return 1 + 1\n\n\ndef add("))
-    var out = despell("run", "-j", "4", "mylib.mathx.clamp")
+    var out = despell("run", "-j", "4", "--force", "mylib.mathx.clamp")
     write_text(path, source)
     assert_true("building the 1 of 2 test files" in out, out)
     assert_true("survived   mylib.mathx.clamp.1" in out, out)
 
+
+def test_7c_code_that_only_moved_keeps_its_results() raises:
+    var path = join(PROJECT, "src/mylib/mathx.mojo")
+    var source = read_text(path)
+    write_text(path, "# a line above everything\n" + source)
+    var out = despell("run", "-j", "4")
+    assert_true("nothing to run" in out, out)
+    assert_expected()
+    # and they're shown where they are now
+    var shown = despell("show", "mylib.mathx.clamp.1")
+    write_text(path, source)
+    assert_true("mathx.mojo:" in shown and not ("source changed" in shown), shown)
+    out = despell("run", "-j", "4")
+    assert_true("nothing to run" in out, out)
+    assert_expected()
 
 def test_8_mutants_cant_signal_other_processes() raises:
     # stopping a child is one mutant (`and` -> `or`) away from `kill(-1)`,
