@@ -5,7 +5,7 @@ Mutation testing for Mojo, written in Mojo (1.2). See README.md for the design.
 - `pixi run build` builds `build/despell`; `pixi run test` builds, then runs every `tests/test_*.mojo` (`mojo run -I src`).
 - `src/despell/tokenizer.mojo`: hand-rolled Mojo tokenizer (no AST anywhere).
 - `src/despell/mutation.mojo`: operators, function discovery, statement-level schemata generation (sites: dup/wrap/decl).
-- `src/despell/runner.mojo`: copy to mutants/, build loop (converge with `--emit llvm`, vindicate suspects, final exe build), pre-check.
+- `src/despell/runner.mojo`: copy to mutants/, build loop (converge with `--emit llvm` on a few test files that together hold every mutant (`_covering_files`), vindicate suspects, final exe build, converging only the files that fail it), pre-check.
 - `src/despell/session.mojo`: a whole run: planning, stats run, mutant runs, saving state.
 - `src/despell/state.mojo`: the state file, locks, and deciding what a test change can affect.
 - `src/despell/cli.mojo`: commands; output is meant to be read by agents.
