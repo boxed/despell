@@ -154,6 +154,15 @@ struct _Job(Copyable, Movable):
     var start_ns: Int
     var processes: Int
     var tests: Int
+    var patience: Float64
+    """What the timeout is multiplied by: more once a batch has timed out."""
+
+
+# A batch that times out runs again with this much more time before the mutant
+# counts as a timeout: the budget leaves out starting the test binary, which on
+# a busy machine can take longer than the tests themselves, and a timeout is a
+# result that stands until the code changes.
+comptime RETRY_PATIENCE = 4.0
 
 
 def _by_duration(a: TestRecord, b: TestRecord) -> Bool:
@@ -346,7 +355,7 @@ def _memory_limit(b: _Batch) -> Int:
 
 def _start(mut r: Run, mut job: _Job) raises:
     ref b = job.batches[job.next]
-    var timeout = max(r.config.timeout_floor, b.budget * r.config.timeout_multiplier)
+    var timeout = max(r.config.timeout_floor, b.budget * r.config.timeout_multiplier) * job.patience
     var env = with_env(r.mojo.env, ["DESPELL_MUTANT=" + String(job.number)])
     r._pool.start(job.number, _test_argv(r, b.file, b.names), r.mdir, env, timeout, _memory_limit(b))
     job.processes += 1
@@ -426,7 +435,7 @@ def run_mutants(
                 r.mutants[n - 1].detail = String("")
                 _report(r.mutants[n - 1])
                 continue
-            var job = _Job(n, _batches(r, tests), 0, monotonic_ns(), 0, 0)
+            var job = _Job(n, _batches(r, tests), 0, monotonic_ns(), 0, 0, 1.0)
             _start(r, job)
             jobs[n] = job^
         if len(r._pool) == 0:
@@ -443,7 +452,7 @@ def run_mutants(
         var n = f.tag
         var job = jobs.pop(n)
         var file = job.batches[job.next].file
-        var timeout = max(r.config.timeout_floor, job.batches[job.next].budget * r.config.timeout_multiplier)
+        var timeout = max(r.config.timeout_floor, job.batches[job.next].budget * r.config.timeout_multiplier) * job.patience
         var finished = True
         if f.over_memory:
             r.mutants[n - 1].status = KILLED
@@ -452,6 +461,11 @@ def run_mutants(
                 "stopped after using " + _megabytes(f.memory) + " of memory (unmutated, its tests use "
                 + _megabytes(job.batches[job.next].memory) + ")"
             )
+        elif f.timed_out and job.patience < RETRY_PATIENCE:
+            job.patience = RETRY_PATIENCE
+            _start(r, job)
+            jobs[n] = job.copy()
+            finished = False
         elif f.timed_out:
             r.mutants[n - 1].status = TIMEOUT
             r.mutants[n - 1].killed_by = file

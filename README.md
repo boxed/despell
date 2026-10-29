@@ -165,7 +165,9 @@ in; the others get their own.
 
 **Running mutants.** Each mutant runs only the tests that reach its statement,
 grouped per test binary, in parallel worker processes, with a timeout derived
-from the measured test durations. Without `-j N`, the number of workers starts
+from the measured test durations (a batch that runs out of time gets one more
+try with four times as long before the mutant counts as a timeout: starting a
+big test binary on a busy machine can take longer than its tests). Without `-j N`, the number of workers starts
 at half the cores and follows the CPU the tests use: tests that mostly wait (on
 I/O, the network, a mutant's timeout) get more workers, until the cores are
 busy or the machine is loaded with other work.
